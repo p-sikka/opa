@@ -320,13 +320,14 @@ func TestShowDebug(t *testing.T) {
 	repl := newRepl(store, &buffer)
 	repl.OneShot(ctx, "show debug")
 
-	var result replDebug
+	var result replDebugState
 
 	if err := util.Unmarshal(buffer.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
 
-	var exp replDebug
+	var exp replDebugState
+	exp.Explain = explainOff
 
 	if !reflect.DeepEqual(result, exp) {
 		t.Fatalf("Expected %+v but got %+v", exp, result)
@@ -340,7 +341,7 @@ func TestShowDebug(t *testing.T) {
 	repl.OneShot(ctx, "profile")
 	repl.OneShot(ctx, "show debug")
 
-	exp.Trace = true
+	exp.Explain = explainFull
 	exp.Metrics = true
 	exp.Instrument = true
 	exp.Profile = true
@@ -886,6 +887,20 @@ func TestEvalConstantRule(t *testing.T) {
 	}
 }
 
+func TestEvalConstantRuleDefaultRootDoc(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore()
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+	repl.OneShot(ctx, "input = 1")
+	buffer.Reset()
+	repl.OneShot(ctx, "input = 2")
+	assertREPLText(t, buffer, "undefined\n")
+	buffer.Reset()
+	repl.OneShot(ctx, "input = 1")
+	assertREPLText(t, buffer, "true\n")
+}
+
 func TestEvalConstantRuleAssignment(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore()
@@ -903,6 +918,14 @@ func TestEvalConstantRuleAssignment(t *testing.T) {
 	repl.OneShot(ctx, "x := 2")
 	assertREPLText(t, buffer, redefined)
 	buffer.Reset()
+
+	repl.OneShot(ctx, "show")
+	assertREPLText(t, buffer, `package repl
+
+x := 2
+`)
+	buffer.Reset()
+
 	repl.OneShot(ctx, "x := 3")
 	assertREPLText(t, buffer, redefined)
 	buffer.Reset()

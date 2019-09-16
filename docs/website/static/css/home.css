@@ -77,31 +77,41 @@ p {
   margin-bottom: 1.3em;
 }
 
-ul, {
+ul {
   list-style: none;
 }
 
-#headline--get-started,
-#headline--learn-more {
-  border: solid 2px #008391;
-  border-radius: 6px;
-  display: inline-block;
+.headline--link {
+  border: solid 3px #008391;
+  border-radius: 8px;
+  display: block;
   font-weight: 700;
-  line-height: 44px;
-  margin: 0 12px 0 0;
+  margin: 20px 30px 0 0;
   text-align: center;
   text-decoration: none;
-  width: 180px;
-}
-
-#headline--get-started {
-  background-color: #008391;
-  color: #fff;
-}
-
-#headline--learn-more {
   background-color: #fff;
   color: #008391;
+  line-height: 30px;
+}
+
+.headline--link-img {
+  padding: 5px;
+  height: 150px;
+  width: 150px;
+  object-fit: contain;
+}
+
+.headline--navtitle {
+  width: 100px;
+  float: left;
+  text-align: left;
+  vertical-align: middle;
+  line-height: 44px;
+  color: rgba(0, 0, 0, .54);
+}
+
+.headline--link-label {
+  margin-top: 10px;
 }
 
 footer {

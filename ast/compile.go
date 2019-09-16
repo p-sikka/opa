@@ -86,11 +86,13 @@ type Compiler struct {
 		metricName string
 		f          func()
 	}
-	maxErrs    int
-	sorted     []string // list of sorted module names
-	pathExists func([]string) (bool, error)
-	after      map[string][]CompilerStageDefinition
-	metrics    metrics.Metrics
+	maxErrs           int
+	sorted            []string // list of sorted module names
+	pathExists        func([]string) (bool, error)
+	after             map[string][]CompilerStageDefinition
+	metrics           metrics.Metrics
+	builtins          map[string]*Builtin
+	unsafeBuiltinsMap map[string]struct{}
 }
 
 // CompilerStage defines the interface for stages in the compiler.
@@ -166,6 +168,13 @@ type QueryCompiler interface {
 	// to Compile will take the QueryContext into account.
 	WithContext(qctx *QueryContext) QueryCompiler
 
+	// WithUnsafeBuiltins sets the built-in functions to treat as unsafe and not
+	// allow inside of queries. By default the query compiler inherits the
+	// compiler's unsafe built-in functions. This function allows callers to
+	// override that set. If an empty (non-nil) map is provided, all built-ins
+	// are allowed.
+	WithUnsafeBuiltins(unsafe map[string]struct{}) QueryCompiler
+
 	// WithStageAfter registers a stage to run during query compilation after
 	// the named stage.
 	WithStageAfter(after string, stage QueryCompilerStageDefinition) QueryCompiler
@@ -200,15 +209,19 @@ func NewCompiler() *Compiler {
 		}, func(x util.T) int {
 			return x.(Ref).Hash()
 		}),
-		maxErrs: CompileErrorLimitDefault,
-		after:   map[string][]CompilerStageDefinition{},
+		maxErrs:           CompileErrorLimitDefault,
+		after:             map[string][]CompilerStageDefinition{},
+		unsafeBuiltinsMap: map[string]struct{}{},
 	}
 
 	c.ModuleTree = NewModuleTree(nil)
 	c.RuleTree = NewRuleTree(c.ModuleTree)
 
+	// Initialize the compiler with the statically compiled built-in functions.
+	// If the caller customizes the compiler, a copy will be made.
+	c.builtins = BuiltinMap
 	checker := newTypeChecker()
-	c.TypeEnv = checker.checkLanguageBuiltins()
+	c.TypeEnv = checker.checkLanguageBuiltins(nil, c.builtins)
 
 	c.stages = []struct {
 		name       string
@@ -240,6 +253,7 @@ func NewCompiler() *Compiler {
 		{"RewriteDynamicTerms", "compile_stage_rewrite_dynamic_terms", c.rewriteDynamicTerms},
 		{"CheckRecursion", "compile_stage_check_recursion", c.checkRecursion},
 		{"CheckTypes", "compile_stage_check_types", c.checkTypes},
+		{"CheckUnsafeBuiltins", "compile_state_check_unsafe_builtins", c.checkUnsafeBuiltins},
 		{"BuildRuleIndices", "compile_stage_rebuild_indices", c.buildRuleIndices},
 	}
 
@@ -275,6 +289,33 @@ func (c *Compiler) WithMetrics(metrics metrics.Metrics) *Compiler {
 	return c
 }
 
+// WithBuiltins adds a set of custom built-in functions to the compiler.
+func (c *Compiler) WithBuiltins(builtins map[string]*Builtin) *Compiler {
+	if len(builtins) == 0 {
+		return c
+	}
+	cpy := make(map[string]*Builtin, len(c.builtins)+len(builtins))
+	for k, v := range c.builtins {
+		cpy[k] = v
+	}
+	for k, v := range builtins {
+		cpy[k] = v
+	}
+	c.builtins = cpy
+	// Build type env for custom functions and wrap existing one.
+	checker := newTypeChecker()
+	c.TypeEnv = checker.checkLanguageBuiltins(c.TypeEnv, builtins)
+	return c
+}
+
+// WithUnsafeBuiltins will add all built-ins in the map to the "blacklist".
+func (c *Compiler) WithUnsafeBuiltins(unsafeBuiltins map[string]struct{}) *Compiler {
+	for name := range unsafeBuiltins {
+		c.unsafeBuiltinsMap[name] = struct{}{}
+	}
+	return c
+}
+
 // QueryCompiler returns a new QueryCompiler object.
 func (c *Compiler) QueryCompiler() QueryCompiler {
 	return newQueryCompiler(c)
@@ -307,7 +348,7 @@ func (c *Compiler) Failed() bool {
 // ref refers to built-in function, the built-in declaration is consulted,
 // otherwise, the ref is used to perform a ruleset lookup.
 func (c *Compiler) GetArity(ref Ref) int {
-	if bi := BuiltinMap[ref.String()]; bi != nil {
+	if bi := c.builtins[ref.String()]; bi != nil {
 		return len(bi.Decl.Args())
 	}
 	rules := c.GetRulesExact(ref)
@@ -458,6 +499,82 @@ func (c *Compiler) GetRules(ref Ref) (rules []*Rule) {
 	return rules
 }
 
+// GetRulesDynamic returns a slice of rules that could be referred to by a ref.
+// When parts of the ref are statically known, we use that information to narrow
+// down which rules the ref could refer to, but in the most general case this
+// will be an over-approximation.
+//
+// E.g., given the following modules:
+//
+//  package a.b.c
+//
+//  r1 = 1  # rule1
+//
+// and:
+//
+//  package a.d.c
+//
+//  r2 = 2  # rule2
+//
+// The following calls yield the rules on the right.
+//
+//  GetRulesDynamic("data.a[x].c[y]")			=> [rule1, rule2]
+//  GetRulesDynamic("data.a[x].c.r2")	=> [rule2]
+//  GetRulesDynamic("data.a.b[x][y]")	=> [rule1]
+func (c *Compiler) GetRulesDynamic(ref Ref) (rules []*Rule) {
+	node := c.RuleTree
+
+	set := map[*Rule]struct{}{}
+	var walk func(node *TreeNode, i int)
+	walk = func(node *TreeNode, i int) {
+		if i >= len(ref) {
+			// We've reached the end of the reference and want to collect everything
+			// under this "prefix".
+			node.DepthFirst(func(descendant *TreeNode) bool {
+				insertRules(set, descendant.Values)
+				return descendant.Hide
+			})
+		} else if i == 0 || IsConstant(ref[i].Value) {
+			// The head of the ref is always grounded.  In case another part of the
+			// ref is also grounded, we can lookup the exact child.  If it's not found
+			// we can immediately return...
+			if child := node.Child(ref[i].Value); child == nil {
+				return
+			} else if len(child.Values) > 0 {
+				// If there are any rules at this position, it's what the ref would
+				// refer to.  We can just append those and stop here.
+				insertRules(set, child.Values)
+			} else {
+				// Otherwise, we continue using the child node.
+				walk(child, i+1)
+			}
+		} else {
+			// This part of the ref is a dynamic term.  We can't know what it refers
+			// to and will just need to try all of the children.
+			for _, child := range node.Children {
+				if child.Hide {
+					continue
+				}
+				insertRules(set, child.Values)
+				walk(child, i+1)
+			}
+		}
+	}
+
+	walk(node, 0)
+	for rule := range set {
+		rules = append(rules, rule)
+	}
+	return rules
+}
+
+// Utility: add all rule values to the set.
+func insertRules(set map[*Rule]struct{}, rules []util.T) {
+	for _, rule := range rules {
+		set[rule.(*Rule)] = struct{}{}
+	}
+}
+
 // RuleIndex returns a RuleIndex built for the rule set referred to by path.
 // The path must refer to the rule set exactly, i.e., given a rule set at path
 // data.a.b.c.p, refs data.a.b.c.p.x and data.a.b.c would not return a
@@ -552,11 +669,15 @@ func (c *Compiler) checkRuleConflicts() {
 		kinds := map[DocKind]struct{}{}
 		defaultRules := 0
 		arities := map[int]struct{}{}
+		declared := false
 
 		for _, rule := range node.Values {
 			r := rule.(*Rule)
 			kinds[r.Head.DocKind()] = struct{}{}
 			arities[len(r.Head.Args)] = struct{}{}
+			if r.Head.Assign {
+				declared = true
+			}
 			if r.Default {
 				defaultRules++
 			}
@@ -564,11 +685,11 @@ func (c *Compiler) checkRuleConflicts() {
 
 		name := Var(node.Key.(String))
 
-		if len(kinds) > 1 || len(arities) > 1 {
+		if declared && len(node.Values) > 1 {
+			c.err(NewError(TypeErr, node.Values[0].(*Rule).Loc(), "rule named %v redeclared at %v", name, node.Values[1].(*Rule).Loc()))
+		} else if len(kinds) > 1 || len(arities) > 1 {
 			c.err(NewError(TypeErr, node.Values[0].(*Rule).Loc(), "conflicting rules named %v found", name))
-		}
-
-		if defaultRules > 1 {
+		} else if defaultRules > 1 {
 			c.err(NewError(TypeErr, node.Values[0].(*Rule).Loc(), "multiple default rules named %s found", name))
 		}
 
@@ -612,7 +733,7 @@ func (c *Compiler) checkSafetyRuleBodies() {
 }
 
 func (c *Compiler) checkBodySafety(safe VarSet, m *Module, b Body) Body {
-	reordered, unsafe := reorderBodyForSafety(c.GetArity, safe, b)
+	reordered, unsafe := reorderBodyForSafety(c.builtins, c.GetArity, safe, b)
 	if errs := safetyErrorSlice(unsafe); len(errs) > 0 {
 		for _, err := range errs {
 			c.err(err)
@@ -658,6 +779,15 @@ func (c *Compiler) checkTypes() {
 		c.err(err)
 	}
 	c.TypeEnv = env
+}
+
+func (c *Compiler) checkUnsafeBuiltins() {
+	for _, name := range c.sorted {
+		errs := checkUnsafeBuiltins(c.unsafeBuiltinsMap, c.Modules[name])
+		for _, err := range errs {
+			c.err(err)
+		}
+	}
 }
 
 func (c *Compiler) runStage(metricName string, f func()) {
@@ -780,7 +910,7 @@ func (c *Compiler) resolveAllRefs() {
 		}
 
 		for id, module := range parsed {
-			c.Modules[id] = module
+			c.Modules[id] = module.Copy()
 			c.sorted = append(c.sorted, id)
 		}
 
@@ -1005,15 +1135,16 @@ func (c *Compiler) setRuleTree() {
 }
 
 func (c *Compiler) setGraph() {
-	c.Graph = NewGraph(c.Modules, c.GetRules)
+	c.Graph = NewGraph(c.Modules, c.GetRulesDynamic)
 }
 
 type queryCompiler struct {
-	compiler  *Compiler
-	qctx      *QueryContext
-	typeEnv   *TypeEnv
-	rewritten map[Var]Var
-	after     map[string][]QueryCompilerStageDefinition
+	compiler       *Compiler
+	qctx           *QueryContext
+	typeEnv        *TypeEnv
+	rewritten      map[Var]Var
+	after          map[string][]QueryCompilerStageDefinition
+	unsafeBuiltins map[string]struct{}
 }
 
 func newQueryCompiler(compiler *Compiler) QueryCompiler {
@@ -1032,6 +1163,11 @@ func (qc *queryCompiler) WithContext(qctx *QueryContext) QueryCompiler {
 
 func (qc *queryCompiler) WithStageAfter(after string, stage QueryCompilerStageDefinition) QueryCompiler {
 	qc.after[after] = append(qc.after[after], stage)
+	return qc
+}
+
+func (qc *queryCompiler) WithUnsafeBuiltins(unsafe map[string]struct{}) QueryCompiler {
+	qc.unsafeBuiltins = unsafe
 	return qc
 }
 
@@ -1072,6 +1208,7 @@ func (qc *queryCompiler) Compile(query Body) (Body, error) {
 		{"CheckSafety", "query_compile_stage_check_safety", qc.checkSafety},
 		{"RewriteDynamicTerms", "query_compile_stage_rewrite_dynamic_terms", qc.rewriteDynamicTerms},
 		{"CheckTypes", "query_compile_stage_check_types", qc.checkTypes},
+		{"CheckUnsafeBuiltins", "query_compile_stage_check_unsafe_builtins", qc.checkUnsafeBuiltins},
 	}
 
 	qctx := qc.qctx.Copy()
@@ -1167,7 +1304,7 @@ func (qc *queryCompiler) rewriteLocalVars(_ *QueryContext, body Body) (Body, err
 
 func (qc *queryCompiler) checkSafety(_ *QueryContext, body Body) (Body, error) {
 	safe := ReservedVars.Copy()
-	reordered, unsafe := reorderBodyForSafety(qc.compiler.GetArity, safe, body)
+	reordered, unsafe := reorderBodyForSafety(qc.compiler.builtins, qc.compiler.GetArity, safe, body)
 	if errs := safetyErrorSlice(unsafe); len(errs) > 0 {
 		return nil, errs
 	}
@@ -1178,6 +1315,20 @@ func (qc *queryCompiler) checkTypes(qctx *QueryContext, body Body) (Body, error)
 	var errs Errors
 	checker := newTypeChecker()
 	qc.typeEnv, errs = checker.CheckBody(qc.compiler.TypeEnv, body)
+	if len(errs) > 0 {
+		return nil, errs
+	}
+	return body, nil
+}
+
+func (qc *queryCompiler) checkUnsafeBuiltins(qctx *QueryContext, body Body) (Body, error) {
+	var unsafe map[string]struct{}
+	if qc.unsafeBuiltins != nil {
+		unsafe = qc.unsafeBuiltins
+	} else {
+		unsafe = qc.compiler.unsafeBuiltinsMap
+	}
+	errs := checkUnsafeBuiltins(unsafe, body)
 	if len(errs) > 0 {
 		return nil, errs
 	}
@@ -1349,7 +1500,7 @@ func NewGraph(modules map[string]*Module, list func(Ref) []*Rule) *Graph {
 		return NewGenericVisitor(func(x interface{}) bool {
 			switch x := x.(type) {
 			case Ref:
-				for _, b := range list(x.GroundPrefix()) {
+				for _, b := range list(x) {
 					for node := b; node != nil; node = node.Else {
 						graph.addDependency(a, node)
 					}
@@ -1571,9 +1722,9 @@ func (vs unsafeVars) Slice() (result []unsafePair) {
 //
 // If the body cannot be reordered to ensure safety, the second return value
 // contains a mapping of expressions to unsafe variables in those expressions.
-func reorderBodyForSafety(arity func(Ref) int, globals VarSet, body Body) (Body, unsafeVars) {
+func reorderBodyForSafety(builtins map[string]*Builtin, arity func(Ref) int, globals VarSet, body Body) (Body, unsafeVars) {
 
-	body, unsafe := reorderBodyForClosures(arity, globals, body)
+	body, unsafe := reorderBodyForClosures(builtins, arity, globals, body)
 	if len(unsafe) != 0 {
 		return nil, unsafe
 	}
@@ -1599,7 +1750,7 @@ func reorderBodyForSafety(arity func(Ref) int, globals VarSet, body Body) (Body,
 				continue
 			}
 
-			safe.Update(outputVarsForExpr(e, arity, safe))
+			safe.Update(outputVarsForExpr(e, builtins, arity, safe))
 
 			for v := range unsafe[e] {
 				if safe.Contains(v) {
@@ -1627,10 +1778,11 @@ func reorderBodyForSafety(arity func(Ref) int, globals VarSet, body Body) (Body,
 			g.Update(reordered[i-1].Vars(safetyCheckVarVisitorParams))
 		}
 		vis := &bodySafetyVisitor{
-			arity:   arity,
-			current: e,
-			globals: g,
-			unsafe:  unsafe,
+			builtins: builtins,
+			arity:    arity,
+			current:  e,
+			globals:  g,
+			unsafe:   unsafe,
 		}
 		Walk(vis, e)
 	}
@@ -1643,10 +1795,11 @@ func reorderBodyForSafety(arity func(Ref) int, globals VarSet, body Body) (Body,
 }
 
 type bodySafetyVisitor struct {
-	arity   func(Ref) int
-	current *Expr
-	globals VarSet
-	unsafe  unsafeVars
+	builtins map[string]*Builtin
+	arity    func(Ref) int
+	current  *Expr
+	globals  VarSet
+	unsafe   unsafeVars
 }
 
 func (vis *bodySafetyVisitor) Visit(x interface{}) Visitor {
@@ -1678,7 +1831,7 @@ func (vis *bodySafetyVisitor) checkComprehensionSafety(tv VarSet, body Body) Bod
 	}
 
 	// Check body for safety, reordering as necessary.
-	r, u := reorderBodyForSafety(vis.arity, vis.globals, body)
+	r, u := reorderBodyForSafety(vis.builtins, vis.arity, vis.globals, body)
 	if len(u) == 0 {
 		return r
 	}
@@ -1704,7 +1857,7 @@ func (vis *bodySafetyVisitor) checkSetComprehensionSafety(sc *SetComprehension) 
 // reorderBodyForClosures returns a copy of the body ordered such that
 // expressions (such as array comprehensions) that close over variables are ordered
 // after other expressions that contain the same variable in an output position.
-func reorderBodyForClosures(arity func(Ref) int, globals VarSet, body Body) (Body, unsafeVars) {
+func reorderBodyForClosures(builtins map[string]*Builtin, arity func(Ref) int, globals VarSet, body Body) (Body, unsafeVars) {
 
 	reordered := Body{}
 	unsafe := unsafeVars{}
@@ -1730,7 +1883,7 @@ func reorderBodyForClosures(arity func(Ref) int, globals VarSet, body Body) (Bod
 			// contained in the output position of an expression in the reordered
 			// body. These vars are considered unsafe.
 			cv := vs.Intersect(body.Vars(safetyCheckVarVisitorParams)).Diff(globals)
-			uv := cv.Diff(outputVarsForBody(reordered, arity, globals))
+			uv := cv.Diff(outputVarsForBody(reordered, builtins, arity, globals))
 
 			if len(uv) == 0 {
 				reordered = append(reordered, e)
@@ -1748,15 +1901,15 @@ func reorderBodyForClosures(arity func(Ref) int, globals VarSet, body Body) (Bod
 	return reordered, unsafe
 }
 
-func outputVarsForBody(body Body, arity func(Ref) int, safe VarSet) VarSet {
+func outputVarsForBody(body Body, builtins map[string]*Builtin, arity func(Ref) int, safe VarSet) VarSet {
 	o := safe.Copy()
 	for _, e := range body {
-		o.Update(outputVarsForExpr(e, arity, o))
+		o.Update(outputVarsForExpr(e, builtins, arity, o))
 	}
 	return o.Diff(safe)
 }
 
-func outputVarsForExpr(expr *Expr, arity func(Ref) int, safe VarSet) VarSet {
+func outputVarsForExpr(expr *Expr, builtins map[string]*Builtin, arity func(Ref) int, safe VarSet) VarSet {
 
 	// Negated expressions must be safe.
 	if expr.Negated {
@@ -1785,14 +1938,14 @@ func outputVarsForExpr(expr *Expr, arity func(Ref) int, safe VarSet) VarSet {
 	terms := expr.Terms.([]*Term)
 	name := terms[0].String()
 
-	if b := BuiltinMap[name]; b != nil {
+	if b := builtins[name]; b != nil {
 		if b.Name == Equality.Name {
 			return outputVarsForExprEq(expr, safe)
 		}
 		return outputVarsForExprBuiltin(expr, b, safe)
 	}
 
-	return outputVarsForExprCall(expr, arity, safe, terms)
+	return outputVarsForExprCall(expr, builtins, arity, safe, terms)
 }
 
 func outputVarsForExprBuiltin(expr *Expr, b *Builtin, safe VarSet) VarSet {
@@ -1845,7 +1998,7 @@ func outputVarsForExprEq(expr *Expr, safe VarSet) VarSet {
 	return output.Diff(safe)
 }
 
-func outputVarsForExprCall(expr *Expr, arity func(Ref) int, safe VarSet, terms []*Term) VarSet {
+func outputVarsForExprCall(expr *Expr, builtins map[string]*Builtin, arity func(Ref) int, safe VarSet, terms []*Term) VarSet {
 
 	output := outputVarsForExprRefs(expr, safe)
 
@@ -2148,30 +2301,30 @@ func resolveRefsInTerm(globals map[Var]Ref, ignore *declaredVarStack, term *Term
 	case *ArrayComprehension:
 		ac := &ArrayComprehension{}
 		ignore.Push(declaredVars(v.Body))
-		defer ignore.Pop()
 		ac.Term = resolveRefsInTerm(globals, ignore, v.Term)
 		ac.Body = resolveRefsInBody(globals, ignore, v.Body)
 		cpy := *term
 		cpy.Value = ac
+		ignore.Pop()
 		return &cpy
 	case *ObjectComprehension:
 		oc := &ObjectComprehension{}
 		ignore.Push(declaredVars(v.Body))
-		defer ignore.Pop()
 		oc.Key = resolveRefsInTerm(globals, ignore, v.Key)
 		oc.Value = resolveRefsInTerm(globals, ignore, v.Value)
 		oc.Body = resolveRefsInBody(globals, ignore, v.Body)
 		cpy := *term
 		cpy.Value = oc
+		ignore.Pop()
 		return &cpy
 	case *SetComprehension:
 		sc := &SetComprehension{}
 		ignore.Push(declaredVars(v.Body))
-		defer ignore.Pop()
 		sc.Term = resolveRefsInTerm(globals, ignore, v.Term)
 		sc.Body = resolveRefsInBody(globals, ignore, v.Body)
 		cpy := *term
 		cpy.Value = sc
+		ignore.Pop()
 		return &cpy
 	default:
 		return term
@@ -3040,4 +3193,18 @@ func safetyErrorSlice(unsafe unsafeVars) (result Errors) {
 	}
 
 	return
+}
+
+func checkUnsafeBuiltins(unsafeBuiltinsMap map[string]struct{}, node interface{}) Errors {
+	errs := make(Errors, 0)
+	WalkExprs(node, func(x *Expr) bool {
+		if x.IsCall() {
+			operator := x.Operator().String()
+			if _, ok := unsafeBuiltinsMap[operator]; ok {
+				errs = append(errs, NewError(TypeErr, x.Loc(), "unsafe built-in function calls in expression: %v", operator))
+			}
+		}
+		return false
+	})
+	return errs
 }

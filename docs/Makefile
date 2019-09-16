@@ -1,8 +1,8 @@
 .PHONY: clean
 clean:
 	rm -rf ${CURDIR}/website/data/releases.yaml
-	rm -rf $(CURDIR)/website/generated 
-	rm -rf $(CURDIR)/website/public 
+	rm -rf $(CURDIR)/website/generated
+	rm -rf $(CURDIR)/website/public
 	rm -rf $(CURDIR)/website/resources
 
 .PHONY: generate
@@ -37,13 +37,16 @@ docker-serve:
 			--source /src/website \
 			--contentDir generated
 
-.PHONY: production-build
-production-build: clean generate
+.PHONY: hugo-production-build
+hugo-production-build:
 	hugo \
 		--source $(CURDIR)/website \
 		--contentDir generated \
 		--ignoreCache \
 		--minify
+
+.PHONY: production-build
+production-build: clean generate hugo-production-build live-blocks-inject
 
 .PHONY: preview-build
 preview-build: clean generate
@@ -55,16 +58,10 @@ preview-build: clean generate
 		--buildFuture \
 		--ignoreCache \
 		--minify
+	make live-blocks-inject
 
-.PHONY: linkcheck-build
-linkcheck-build:
-	hugo \
-		--source $(CURDIR)/website \
-		--contentDir generated \
-		--baseURL "/" \
-		--buildDrafts \
-		--buildFuture
-
-.PHONY: linkcheck
-linkcheck: clean generate linkcheck-build
-	htmlproofer ./public --empty-alt-ignore
+# The live-blocks-% pattern target will shim to the
+# npm scripts in ./website/scripts/live-blocks
+.PHONY: live-blocks-%
+live-blocks-%:
+	cd $(CURDIR)/website/scripts/live-blocks && npm run --silent $*

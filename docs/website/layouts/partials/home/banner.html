@@ -2,8 +2,14 @@
 {{ $description := site.Params.description }}
 {{ $tagline     := site.Params.tagline }}
 {{ $socialMenu  := site.Menus.social }}
-{{ $docs        := "/docs/latest" }}
-{{ $getStarted  := "/docs/latest/get-started" }}
+{{ $docs        := "/docs/latest/" }}
+{{ $introduction  := "/docs/latest/" }}
+{{ $tutorial  := "/docs/latest/get-started/" }}
+{{ $policyLanguage  := "/docs/latest/policy-language/" }}
+{{ $kubernetes  := "/docs/latest/kubernetes-introduction/" }}
+{{ $envoy  := "/docs/latest/envoy-authorization/" }}
+{{ $kafka  := "/docs/latest/kafka-authorization/" }}
+{{ $opaSummit  := "https://www.papercall.io/opa-summit" }}
 <header role="banner">
   <nav class="nav--banner" role="navigation">
     <ul class="nav--menu">
@@ -20,7 +26,7 @@
       </li>
 
       <li class="nav--menu-item nav--docs">
-        <a href="{{ $getStarted }}" rel="help">
+        <a href="{{ $tutorial }}" rel="help">
           Tutorials
         </a>
       </li>
@@ -61,16 +67,30 @@
       <p class="headline--subtitle">
         {{ $tagline }}
       </p>
-
-      <p class="headline--nav">
-        <a id="headline--get-started" href="{{ $getStarted }}" rel="help">
-          Get started
+      <div class="headline--nav headline--columns columns">
+        <a class="column headline--link is-narrow" href="{{ $docs }}" rel="help">
+          <img class="headline--link-img" src="/img/logos/opa-no-text-color.png"/>
+          <div class="headline--link-label">Documentation</div>
         </a>
-
-        <a id="headline--learn-more" href="{{ $docs }}" rel="help">
-          Learn more
+        <a class="column headline--link is-narrow" href="{{ $kubernetes }}" rel="help">
+          <img class="headline--link-img" src="/img/logos/kubernetes.png"/>
+          <div class="headline--link-label">Guide & Tutorial</div>
         </a>
-      </p>
+        <a class="column headline--link is-narrow" href="{{ $envoy }}" rel="help">
+          <img class="headline--link-img" src="/img/logos/envoy.png" />
+          <div class="headline--link-label">Tutorial</div>
+        </a>
+        <a class="column headline--link is-narrow" href="{{ $kafka }}" rel="help">
+          <img class="headline--link-img" src="/img/logos/kafka.png"/>
+          <div class="headline--link-label">Tutorial</div>
+        </a>
+        <a class="column headline--link is-narrow" href="{{ $opaSummit }}" rel="help">
+          <img class="headline--link-img" src="/img/logos/opa-summit.png" />
+          <div class="headline--link-label">OPA Summit 2019</div>
+        </a>
+      </span>
+
+      </div>
     </div>
 
     <div class="headline--wave--bg" role="presentation"></div>

@@ -1,10 +1,13 @@
 ---
 title: Monitoring
-kind: documentation
-weight: 12
+kind: operations
+weight: 30
+restrictedtoc: true
 ---
 
-## Prometheus
+## Monitoring
+
+### Prometheus
 
 OPA exposes an HTTP endpoint that can be used to collect performance metrics
 for all API calls. The Prometheus endpoint is enabled by default when you run
@@ -23,12 +26,7 @@ scrape_configs:
       - "localhost:8181"
 ```
 
-## Health Checks
+### Health Checks
 
 OPA exposes a `/health` API endpoint that can be used to perform health checks.
-See [Health API](/docs/{{< current_version >}}/rest-api#health-api) for details.
-
-## Diagnostics (Deprecated)
-
-The diagnostics feature is deprecated. If you need to monitor OPA decisions, see
-the [Decision Log](../decision-logs) API.
+See [Health API](../rest-api#health-api) for details.

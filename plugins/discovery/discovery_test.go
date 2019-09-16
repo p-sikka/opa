@@ -120,7 +120,7 @@ func TestProcessBundle(t *testing.T) {
 		}
 	`)
 
-	_, ps, err := processBundle(ctx, manager, nil, initialBundle, "data.config")
+	_, ps, err := processBundle(ctx, manager, nil, initialBundle, "data.config", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestProcessBundle(t *testing.T) {
 		}
 	`)
 
-	_, ps, err = processBundle(ctx, manager, nil, updatedBundle, "data.config")
+	_, ps, err = processBundle(ctx, manager, nil, updatedBundle, "data.config", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestProcessBundle(t *testing.T) {
 		}
 	`)
 
-	_, _, err = processBundle(ctx, manager, nil, updatedBundle, "data.config")
+	_, _, err = processBundle(ctx, manager, nil, updatedBundle, "data.config", nil)
 	if err == nil {
 		t.Fatal("Expected error but got success")
 	}
@@ -389,5 +389,88 @@ func makeDataBundle(n int, s string) *bundleApi.Bundle {
 	return &bundleApi.Bundle{
 		Manifest: bundleApi.Manifest{Revision: fmt.Sprintf("test-revision-%v", n)},
 		Data:     util.MustUnmarshalJSON([]byte(s)).(map[string]interface{}),
+	}
+}
+
+func getTestManager(t *testing.T, conf string) *plugins.Manager {
+	t.Helper()
+	store := inmem.New()
+	manager, err := plugins.New([]byte(conf), "test-instance-id", store)
+	if err != nil {
+		t.Fatalf("failed to create plugin manager: %s", err)
+	}
+	return manager
+}
+
+func TestGetPluginSetWithMixedConfig(t *testing.T) {
+	conf := `
+services:
+  s1:
+    url: http://test1.com
+  s2:
+    url: http://test2.com
+
+bundles:
+  bundle-new:
+    service: s1
+
+bundle:
+  name: bundle-classic
+  service: s2
+`
+	manager := getTestManager(t, conf)
+	_, err := getPluginSet(nil, manager, manager.Config, nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	p := manager.Plugin(bundle.Name)
+	if p == nil {
+		t.Fatal("Unable to find bundle plugin on manager")
+	}
+	bp := p.(*bundle.Plugin)
+
+	// make sure the older style `bundle` config takes precedence
+	if bp.Config().Name != "bundle-classic" {
+		t.Fatal("Expected bundle plugin config Name to be 'bundle-classic'")
+	}
+
+	if len(bp.Config().Bundles) != 1 {
+		t.Fatal("Expected a single bundle configured")
+	}
+
+	if bp.Config().Bundles["bundle-classic"].Service != "s2" {
+		t.Fatalf("Expected the classic bundle to be configured as bundles[0], got: %+v", bp.Config().Bundles)
+	}
+}
+
+func TestGetPluginSetWithBundlesConfig(t *testing.T) {
+	conf := `
+services:
+  s1:
+    url: http://test1.com
+
+bundles:
+  bundle-new:
+    service: s1
+`
+	manager := getTestManager(t, conf)
+	_, err := getPluginSet(nil, manager, manager.Config, nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	p := manager.Plugin(bundle.Name)
+	if p == nil {
+		t.Fatal("Unable to find bundle plugin on manager")
+	}
+	bp := p.(*bundle.Plugin)
+
+	if len(bp.Config().Bundles) != 1 {
+		t.Fatal("Expected a single bundle configured")
+	}
+
+	if bp.Config().Bundles["bundle-new"].Service != "s1" {
+		t.Fatalf("Expected the bundle to be configured as bundles[0], got: %+v", bp.Config().Bundles)
 	}
 }

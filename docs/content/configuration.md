@@ -1,7 +1,7 @@
 ---
-title: Configuration Reference
-kind: documentation
-weight: 7
+title: Configuration
+kind: operations
+weight: 10
 ---
 
 This page defines the format of OPA configuration files. Fields marked as
@@ -19,7 +19,7 @@ opa run -s -c config.yaml
 The file can be either JSON or YAML format.
 
 
-## Example
+#### Example
 
 ```yaml
 services:
@@ -34,13 +34,13 @@ labels:
   region: west
   environment: production
 
-bundle:
-  name: http/example/authz
-  service: acmecorp
-  prefix: bundles
-  polling:
-    min_delay_seconds: 60
-    max_delay_seconds: 120
+bundles:
+  authz:
+    service: acmecorp
+    resource: bundles/http/example/authz.tar.gz
+    polling:
+      min_delay_seconds: 60
+      max_delay_seconds: 120
 
 decision_logs:
   service: acmecorp
@@ -54,7 +54,7 @@ status:
 default_decision: /http/example/authz/allow
 ```
 
-## Environment Variable Substitution
+#### Environment Variable Substitution
 > Only supported with the OPA runtime (`opa run`).
 
 Environment variables referenced with the `${...}` notation within the configuration
@@ -79,7 +79,7 @@ file is loaded by the OPA runtime.
 > If the variable is undefined then an empty string (`""`) is substituted. It will __not__
 raise an error.
 
-## CLI Runtime Overrides
+#### CLI Runtime Overrides
 > Only supported with the OPA runtime (`opa run`).
 
 Using `opa run` there are CLI options to explicitly set config values. These will override
@@ -134,8 +134,8 @@ opa run --set-file "services.acmecorp.credentials.bearer.token=/var/run/secrets/
 
 It will read the contents of the file and set the config value with the token.
 
-### Override Limitations
-#### Lists
+###### Override Limitations
+####### Lists
 If using arrays/lists in the configuration the `--set` and `--set-file` overrides will not be able to
 patch sub-objects of the list. They will overwrite the entire index with the new object.
 
@@ -166,7 +166,7 @@ Because the entire `0` index was overwritten.
 
 It is highly recommended to use objects/maps instead of lists for configuration for this reason.
 
-#### Empty objects
+####### Empty objects
 If you need to set an empty object with the CLI overrides, for example with plugin configuration like:
 
 ```yaml
@@ -183,7 +183,7 @@ You can do this by setting the value with `null`. For example:
 opa run --set "decision_logger.plugin=my_plugin" --set "plugins.my_plugin=null"
 ```
 
-#### Keys with Special Characters
+####### Keys with Special Characters
 
 If you have a key which contains a special character (`.`, `=`, etc), like `opa.example.com`, and want to use
 the `--set` or `--set-file` options you will need to escape the character with a backslash (`\`).
@@ -213,7 +213,7 @@ _or_
 
 Where the end result passed into OPA still has the `\.` preserved.
 
-## Services
+#### Services
 
 Services represent endpoints that implement one or more control plane APIs
 such as the Bundle or Status APIs. OPA configuration files may contain
@@ -229,10 +229,10 @@ multiple services.
 Each service may optionally specify a credential mechanism by which OPA will authenticate
 itself to the service.
 
-### Bearer token
+#### Bearer token
 
 OPA will authenticate using the specified bearer token and schema; to enable bearer token
-authentication, the token must be specified. The schema is optional and will default to `Bearer` 
+authentication, the token must be specified. The schema is optional and will default to `Bearer`
 if unspecified.
 
 | Field | Type | Required | Description |
@@ -240,7 +240,7 @@ if unspecified.
 | `services[_].credentials.bearer.token` | `string` | Yes | Enables token-based authentication and supplies the bearer token to authenticate with. |
 | `services[_].credentials.bearer.scheme` | `string` | No | Bearer token scheme to specify. |
 
-### Client TLS certificate
+#### Client TLS certificate
 
 OPA will present the specified TLS certificate to authenticate. The paths to the client certificate
 and the private key are required; the passphrase for the private key is only required if the
@@ -252,10 +252,10 @@ private key is encrypted.
 | `services[_].credentials.client_tls.private_key` | `string` | Yes | The path to the private key of the client certificate. |
 | `services[_].credentials.client_tls.private_key_passphrase` | `string` | No | The passphrase to use for the private key. |
 
-### AWS signature
+#### AWS signature
 
-OPA will authenticate with an [AWS4 HMAC](https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-auth-using-authorization-header.html) signature. Two methods of obtaining the 
-necessary credentials are available; exactly one must be specified to use the AWS signature 
+OPA will authenticate with an [AWS4 HMAC](https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-auth-using-authorization-header.html) signature. Two methods of obtaining the
+necessary credentials are available; exactly one must be specified to use the AWS signature
 authentication method.
 
 If specifying `environment_credentials`, OPA will expect to find environment variables
@@ -266,19 +266,19 @@ convention used by the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguid
 | --- | --- | --- | --- |
 | `services[_].credentials.s3_signing.environment_credentials` | `{}` | Yes | Enables AWS signing using environment variables to source the configuration and credentials |
 
-If specifying `metadata_credentials`, OPA will use the AWS metadata services for [EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html) 
+If specifying `metadata_credentials`, OPA will use the AWS metadata services for [EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html)
 or [ECS](https://docs.aws.amazon.com/AmazonECS/latest/userguide/task-iam-roles.html)
-to obtain the necessary credentials when running within a supported virtual machine/container. 
+to obtain the necessary credentials when running within a supported virtual machine/container.
 
-To use the EC2 metadata service, the IAM role to use and the AWS region for the resource must both 
-be specified as `iam_role` and `aws_region` respectively. 
+To use the EC2 metadata service, the IAM role to use and the AWS region for the resource must both
+be specified as `iam_role` and `aws_region` respectively.
 
 To use the ECS metadata service, specify only the AWS region for the resource as `aws_region`. ECS
 containers have at most one associated IAM role.
 
-**N.B.** Providing a value for `iam_role` will cause OPA to use the EC2 metadata service even 
-if running inside an ECS container. This may result in unexpected problems if, for example, 
-there is no route to the EC2 metadata service from inside the container or if the IAM role is only available within the container and not from the hosting EC2 instance. 
+**N.B.** Providing a value for `iam_role` will cause OPA to use the EC2 metadata service even
+if running inside an ECS container. This may result in unexpected problems if, for example,
+there is no route to the EC2 metadata service from inside the container or if the IAM role is only available within the container and not from the hosting EC2 instance.
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -304,7 +304,7 @@ services:
     url: https://s2/
 ```
 
-## Miscellaneous
+### Miscellaneous
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -313,7 +313,21 @@ services:
 | `default_authorization_decision` | `string` | No (default: `/system/authz/allow`) | Set path of default authorization decision for OPA's API. |
 | `plugins` | `object` | No (default: `{}`) | Location for custom plugin configuration. See [Plugins](../plugins) for details. |
 
-## Bundles
+### Bundles
+
+Bundles are defined with a key that is the `name` of the bundle. This `name` is used in the status API, decision logs,
+server provenance, etc.
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `bundles[_].resource` | `string` | No (default: `bundles/<name>`) | Resource path to use to download bundle from configured service. |
+| `bundles[_].service` | `string` | Yes | Name of service to use to contact remote server. |
+| `bundles[_].polling.min_delay_seconds` | `int64` | No (default: `60`) | Minimum amount of time to wait between bundle downloads. |
+| `bundles[_].polling.max_delay_seconds` | `int64` | No (default: `120`) | Maximum amount of time to wait between bundle downloads. |
+
+### Bundle (Deprecated)
+
+>  Deprecated in favor of `bundles` (see above).
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -323,14 +337,14 @@ services:
 | `bundle.polling.min_delay_seconds` | `int64` | No (default: `60`) | Minimum amount of time to wait between bundle downloads. |
 | `bundle.polling.max_delay_seconds` | `int64` | No (default: `120`) | Maximum amount of time to wait between bundle downloads. |
 
-## Status
+### Status
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `status.service` | `string` | Yes | Name of service to use to contact remote server. |
 | `status.partition_name` | `string` | No | Path segment to include in status updates. |
 
-## Decision Logs
+### Decision Logs
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -342,9 +356,9 @@ services:
 | `decision_logs.reporting.max_delay_seconds` | `int64` | No (default: `600`) | Maximum amount of time to wait between uploads. |
 | `decision_logs.mask_decision` | `string` | No (default: `system/log/mask`) | Set path of masking decision. |
 | `decision_logs.plugin` | `string` | No | Use the named plugin for decision logging. If this field exists, the other configuration fields are not required. |
-| `decision_logs.console` | `boolean` | No (default: `false`) | Log the decisions locally at `info` level to the console. When enabled alongside a remote decision logging API the `service` must be configured, the default `service` selection will be disabled. | 
+| `decision_logs.console` | `boolean` | No (default: `false`) | Log the decisions locally at `info` level to the console. When enabled alongside a remote decision logging API the `service` must be configured, the default `service` selection will be disabled. |
 
-## Discovery
+### Discovery
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |

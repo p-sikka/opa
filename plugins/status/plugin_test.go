@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/plugins"
 	"github.com/open-policy-agent/opa/plugins/bundle"
 	"github.com/open-policy-agent/opa/storage/inmem"
@@ -30,7 +31,7 @@ func TestMain(m *testing.M) {
 
 func TestPluginStart(t *testing.T) {
 
-	fixture := newTestFixture(t)
+	fixture := newTestFixture(t, nil)
 	fixture.server.ch = make(chan UpdateRequestV1)
 	defer fixture.server.stop()
 
@@ -58,9 +59,91 @@ func TestPluginStart(t *testing.T) {
 	}
 }
 
+func TestPluginStartBulkUpdate(t *testing.T) {
+
+	fixture := newTestFixture(t, nil)
+	fixture.server.ch = make(chan UpdateRequestV1)
+	defer fixture.server.stop()
+
+	ctx := context.Background()
+
+	fixture.plugin.Start(ctx)
+	defer fixture.plugin.Stop(ctx)
+
+	status := testStatus()
+
+	fixture.plugin.BulkUpdateBundleStatus(map[string]*bundle.Status{status.Name: status})
+	result := <-fixture.server.ch
+
+	exp := UpdateRequestV1{
+		Labels: map[string]string{
+			"id":      "test-instance-id",
+			"app":     "example-app",
+			"version": version.Version,
+		},
+		Bundles: map[string]*bundle.Status{status.Name: status},
+	}
+
+	if !reflect.DeepEqual(result, exp) {
+		t.Fatalf("Expected: %v but got: %v", exp, result)
+	}
+}
+
+func TestPluginStartBulkUpdateMultiple(t *testing.T) {
+
+	fixture := newTestFixture(t, nil)
+	fixture.server.ch = make(chan UpdateRequestV1)
+	defer fixture.server.stop()
+
+	ctx := context.Background()
+
+	fixture.plugin.Start(ctx)
+	defer fixture.plugin.Stop(ctx)
+
+	statuses := map[string]*bundle.Status{}
+	tDownload, _ := time.Parse("2018-01-01T00:00:00.0000000Z", time.RFC3339Nano)
+	tActivate, _ := time.Parse("2018-01-01T00:00:01.0000000Z", time.RFC3339Nano)
+	for i := 0; i < 20; i++ {
+		name := fmt.Sprintf("test-bundle-%d", i)
+		statuses[name] = &bundle.Status{
+			Name:                     name,
+			ActiveRevision:           fmt.Sprintf("v%d", i),
+			LastSuccessfulDownload:   tDownload,
+			LastSuccessfulActivation: tActivate,
+		}
+	}
+
+	fixture.plugin.BulkUpdateBundleStatus(statuses)
+	result := <-fixture.server.ch
+
+	expLabels := map[string]string{
+		"id":      "test-instance-id",
+		"app":     "example-app",
+		"version": version.Version,
+	}
+
+	if !reflect.DeepEqual(result.Labels, expLabels) {
+		t.Fatalf("Unexpected status labels: %+v", result.Labels)
+	}
+
+	if len(result.Bundles) != len(statuses) {
+		t.Fatalf("Expected %d statuses, got %d", len(statuses), len(result.Bundles))
+	}
+
+	for name, s := range statuses {
+		actualStatus := result.Bundles[name]
+		if actualStatus.Name != s.Name ||
+			actualStatus.LastSuccessfulActivation != s.LastSuccessfulActivation ||
+			actualStatus.LastSuccessfulDownload != s.LastSuccessfulDownload ||
+			actualStatus.ActiveRevision != s.ActiveRevision {
+			t.Errorf("Bundle %s has unexpected status:\n\n %v\n\nExpected:\n%v\n\n", name, actualStatus, s)
+		}
+	}
+}
+
 func TestPluginStartDiscovery(t *testing.T) {
 
-	fixture := newTestFixture(t)
+	fixture := newTestFixture(t, nil)
 	fixture.server.ch = make(chan UpdateRequestV1)
 	defer fixture.server.stop()
 
@@ -89,33 +172,36 @@ func TestPluginStartDiscovery(t *testing.T) {
 }
 
 func TestPluginBadAuth(t *testing.T) {
-	fixture := newTestFixture(t)
+	fixture := newTestFixture(t, nil)
 	ctx := context.Background()
 	fixture.server.expCode = 401
 	defer fixture.server.stop()
-	err := fixture.plugin.oneShot(ctx, false, bundle.Status{})
+	fixture.plugin.lastBundleStatus = &bundle.Status{}
+	err := fixture.plugin.oneShot(ctx)
 	if err == nil {
 		t.Fatal("Expected error")
 	}
 }
 
 func TestPluginBadPath(t *testing.T) {
-	fixture := newTestFixture(t)
+	fixture := newTestFixture(t, nil)
 	ctx := context.Background()
 	fixture.server.expCode = 404
 	defer fixture.server.stop()
-	err := fixture.plugin.oneShot(ctx, false, bundle.Status{})
+	fixture.plugin.lastBundleStatus = &bundle.Status{}
+	err := fixture.plugin.oneShot(ctx)
 	if err == nil {
 		t.Fatal("Expected error")
 	}
 }
 
 func TestPluginBadStatus(t *testing.T) {
-	fixture := newTestFixture(t)
+	fixture := newTestFixture(t, nil)
 	ctx := context.Background()
 	fixture.server.expCode = 500
 	defer fixture.server.stop()
-	err := fixture.plugin.oneShot(ctx, false, bundle.Status{})
+	fixture.plugin.lastBundleStatus = &bundle.Status{}
+	err := fixture.plugin.oneShot(ctx)
 	if err == nil {
 		t.Fatal("Expected error")
 	}
@@ -123,7 +209,7 @@ func TestPluginBadStatus(t *testing.T) {
 
 func TestPluginReconfigure(t *testing.T) {
 	ctx := context.Background()
-	fixture := newTestFixture(t)
+	fixture := newTestFixture(t, nil)
 	defer fixture.server.stop()
 
 	if err := fixture.plugin.Start(ctx); err != nil {
@@ -145,13 +231,35 @@ func TestPluginReconfigure(t *testing.T) {
 	}
 }
 
+func TestMetrics(t *testing.T) {
+	fixture := newTestFixture(t, metrics.New())
+	fixture.server.ch = make(chan UpdateRequestV1)
+	defer fixture.server.stop()
+
+	ctx := context.Background()
+
+	fixture.plugin.Start(ctx)
+	defer fixture.plugin.Stop(ctx)
+
+	status := testStatus()
+
+	fixture.plugin.BulkUpdateBundleStatus(map[string]*bundle.Status{"bundle": status})
+	result := <-fixture.server.ch
+
+	exp := map[string]interface{}{"<built-in>": map[string]interface{}{}}
+
+	if !reflect.DeepEqual(result.Metrics, exp) {
+		t.Fatalf("Expected %v but got %v", exp, result.Metrics)
+	}
+}
+
 type testFixture struct {
 	manager *plugins.Manager
 	plugin  *Plugin
 	server  *testServer
 }
 
-func newTestFixture(t *testing.T) testFixture {
+func newTestFixture(t *testing.T, m metrics.Metrics) testFixture {
 
 	ts := testServer{
 		t:       t,
@@ -186,9 +294,9 @@ func newTestFixture(t *testing.T) testFixture {
 			"service": "example",
 		}`))
 
-	config, _ := ParseConfig([]byte(pluginConfig), manager.Services())
+	config, _ := ParseConfig(pluginConfig, manager.Services())
 
-	p := New(config, manager)
+	p := New(config, manager).WithMetrics(m)
 
 	return testFixture{
 		manager: manager,

@@ -9,7 +9,7 @@ Requirements:
 
 - Git
 - GitHub account (if you are contributing)
-- Go (version 1.11 is supported though older versions are likely to work)
+- Go (version 1.12 is supported though older versions are likely to work)
 - GNU Make
 
 ## Getting Started
@@ -96,6 +96,18 @@ with `make check`.
 
    > If you are not familiar with squashing commits, see [the following blog post for a good overview](http://gitready.com/advanced/2009/02/10/squashing-commits-with-rebase.html).
 
+## Benchmarks
+
+Several packages in this repository implement benchmark tests. To execute the
+benchmarks you can run `make perf` in the top-level directory. We use the Go
+benchmarking framework for all benchmarks. The benchmarks run on every pull
+request.
+
+To help catch performance regressions we also run a batch job that compares the
+benchmark results from the tip of master against the last major release. All of
+the results are posted and can be viewed
+[here](https://opa-benchmark-results.s3.amazonaws.com/index.html).
+
 ## Dependencies
 
 [Glide](https://github.com/Masterminds/glide) is a command line tool used for
@@ -127,9 +139,7 @@ code is kept in the repository so that commands such as `go get` work.
 
 ## Go
 
-If you need to update the version of Go that OPA's CI and release
-builder use, update the Go version in the Makefile and .travis.yml
-files. You will also need to bump the version of the release builder
-and re-build it using the `release-builder` target. Note, you will
-need push access on the openpolicyagent DockerHub account to release
-the new version of the `release-builder` as this is not automated yet.
+If you need to update the version of Go used to build OPA you must update these
+files in the root of this repository:
+
+* `Makefile`- which is used to produce releases locally. Update the `GOVERSION` variable.

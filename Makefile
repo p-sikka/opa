@@ -2,10 +2,10 @@
 # Use of this source code is governed by an Apache2
 # license that can be found in the LICENSE file.
 
-VERSION := 0.13.0-dev
+VERSION := 0.15.0-dev
 
 GO := go
-GOVERSION := 1.11
+GOVERSION := 1.12.9
 GOARCH := $(shell go env GOARCH)
 GOOS := $(shell go env GOOS)
 
@@ -21,7 +21,7 @@ BUILD_COMMIT := $(shell ./build/get-build-commit.sh)
 BUILD_TIMESTAMP := $(shell ./build/get-build-timestamp.sh)
 BUILD_HOSTNAME := $(shell ./build/get-build-hostname.sh)
 
-RELEASE_BUILDER_VERSION := 1.2
+RELEASE_BUILD_IMAGE := golang:$(GOVERSION)
 
 LDFLAGS := "-X github.com/open-policy-agent/opa/version.Version=$(VERSION) \
 	-X github.com/open-policy-agent/opa/version.Vcs=$(BUILD_COMMIT) \
@@ -37,6 +37,8 @@ export GO15VENDOREXPERIMENT
 #
 ######################################################
 
+# If you update the 'all' target check/update the call in Dockerfile.build target
+# to make sure they're consistent.
 .PHONY: all
 all: deps build test perf check
 
@@ -48,6 +50,32 @@ version:
 deps:
 	@./build/install-deps.sh
 
+.PHONY: generate
+generate: wasm-build
+	$(GO) generate
+
+.PHONY: build
+build: go-build
+
+.PHONY: image
+image: build-linux
+	@$(MAKE) image-quick
+
+.PHONY: install
+install: generate
+	$(GO) install -ldflags $(LDFLAGS)
+
+.PHONY: test
+test: wasm-test go-test wasm-rego-test
+
+.PHONY: go-build
+go-build: generate
+	$(GO) build -o $(BIN) -ldflags $(LDFLAGS)
+
+.PHONY: go-test
+go-test: generate
+	$(GO) test ./...
+
 .PHONY: wasm-build
 wasm-build:
 ifeq ($(DOCKER_INSTALLED), 1)
@@ -57,88 +85,30 @@ else
 	@echo "Docker not installed. Skipping OPA-WASM library build."
 endif
 
-.PHONY: generate
-generate: wasm-build
-	$(GO) generate
+.PHONY: wasm-clean
+wasm-clean:
+	@$(MAKE) -C wasm clean
 
-.PHONY: build
-build: go-build
-
-.PHONY: go-build
-go-build: generate
-	$(GO) build -o $(BIN) -ldflags $(LDFLAGS)
-
-.PHONY: image
-image:
-	@$(MAKE) build GOOS=linux
-	@$(MAKE) image-quick
-
-.PHONY: image-quick
-image-quick:
-	sed -e 's/GOARCH/$(GOARCH)/g' Dockerfile.in > .Dockerfile_$(GOARCH)
-	sed -e 's/GOARCH/$(GOARCH)/g' Dockerfile_debug.in > .Dockerfile_debug_$(GOARCH)
-	sed -e 's/GOARCH/$(GOARCH)/g' Dockerfile_rootless.in > .Dockerfile_rootless_$(GOARCH)
-	docker build -t $(IMAGE):$(VERSION)	-f .Dockerfile_$(GOARCH) .
-	docker build -t $(IMAGE):$(VERSION)-debug -f .Dockerfile_debug_$(GOARCH) .
-	docker build -t $(IMAGE):$(VERSION)-rootless -f .Dockerfile_rootless_$(GOARCH) .
-
-.PHONY: push
-push:
-	docker push $(IMAGE):$(VERSION)
-	docker push $(IMAGE):$(VERSION)-debug
-	docker push $(IMAGE):$(VERSION)-rootless
-
-.PHONY: tag-latest
-tag-latest:
-	docker tag $(IMAGE):$(VERSION) $(IMAGE):latest
-	docker tag $(IMAGE):$(VERSION)-debug $(IMAGE):latest-debug
-	docker tag $(IMAGE):$(VERSION)-rootless $(IMAGE):latest-rootless
-
-.PHONY: push-latest
-push-latest:
-	docker push $(IMAGE):latest
-	docker push $(IMAGE):latest-debug
-	docker push $(IMAGE):latest-rootless
-
-.PHONY: docker-login
-docker-login:
-	@docker login -u ${DOCKER_USER} -p ${DOCKER_PASSWORD}
-
-.PHONY: deploy-travis
-deploy-travis: docker-login image-quick push
-
-.PHONY: release-travis
-release-travis: deploy-travis tag-latest push-latest
-
-.PHONY: release-bugfix-travis
-release-bugfix-travis: deploy-travis
-
-.PHONY: install
-install: generate
-	$(GO) install -ldflags $(LDFLAGS)
-
-.PHONY: test
-test: opa-wasm-test go-test wasm-test
-
-.PHONY: opa-wasm-test
-opa-wasm-test:
+.PHONY: wasm-test
+wasm-test:
 ifeq ($(DOCKER_INSTALLED), 1)
-	@$(MAKE)  -C wasm test
+	@$(MAKE) -C wasm test
 else
 	@echo "Docker not installed. Skipping OPA-WASM library test."
 endif
 
-.PHONY: go-test
-go-test: generate
-	$(GO) test ./...
-
 .PHONY: wasm-test
-wasm-test: generate
+wasm-rego-test: _test/testcases.tar.gz
 ifeq ($(DOCKER_INSTALLED), 1)
 	@./build/run-wasm-tests.sh
 else
 	@echo "Docker not installed. Skipping WASM-based test execution."
 endif
+
+_test/testcases.tar.gz: $(shell find ./test/wasm/ -type f)
+	go run test/wasm/cmd/testgen.go \
+		--input-dir test/wasm/assets \
+		--output $@
 
 .PHONY: perf
 perf: generate
@@ -163,13 +133,8 @@ check-lint:
 fmt:
 	$(GO) fmt ./...
 
-.PHONY: wasm-clean
-wasm-clean:
-	@$(MAKE) -C wasm clean
-
 .PHONY: clean
 clean: wasm-clean
-	rm -f .Dockerfile_*
 	rm -f opa_*_*
 	rm -fr _test
 
@@ -181,39 +146,145 @@ docs-%:
 
 ######################################################
 #
+# CI targets
+#
+######################################################
+
+.PHONY: travis-build
+travis-build: wasm-build
+	@# this image is used in `Dockerfile` for image-quick
+	$(DOCKER) build -t build-$(BUILD_COMMIT) --build-arg GOVERSION=$(GOVERSION) -f Dockerfile.build .
+	@# the '/.' means "don't create the directory, copy its content only"
+	@# these are copied our to be used from the s3 upload targets
+	@# note: we don't bother cleaning up the container created here
+	$(DOCKER) cp "$$($(DOCKER) create build-$(BUILD_COMMIT)):/out/." .
+
+.PHONY: travis-test
+travis-test: travis-build wasm-test wasm-rego-test
+	$(DOCKER) run build-$(BUILD_COMMIT) make go-test perf check
+
+.PHONY: travis-all
+travis-all: travis-test docker-fuzzit-local-regression
+
+.PHONY: build-linux
+build-linux:
+	@$(MAKE) build GOOS=linux
+
+.PHONY: build-darwin
+build-darwin:
+	@$(MAKE) build GOOS=darwin
+
+.PHONY: build-windows
+build-windows:
+	@$(MAKE) build GOOS=windows
+	mv opa_windows_$(GOARCH) opa_windows_$(GOARCH).exe
+
+.PHONY: image-quick
+image-quick:
+	$(DOCKER) build --build-arg BUILD_COMMIT=$(BUILD_COMMIT) -t $(IMAGE):$(VERSION) .
+	$(DOCKER) build --build-arg BUILD_COMMIT=$(BUILD_COMMIT) -t $(IMAGE):$(VERSION)-debug --build-arg VARIANT=:debug .
+	$(DOCKER) build --build-arg BUILD_COMMIT=$(BUILD_COMMIT) -t $(IMAGE):$(VERSION)-rootless --build-arg USER=1 .
+
+.PHONY: push
+push:
+	$(DOCKER) push $(IMAGE):$(VERSION)
+	$(DOCKER) push $(IMAGE):$(VERSION)-debug
+	$(DOCKER) push $(IMAGE):$(VERSION)-rootless
+
+.PHONY: tag-latest
+tag-latest:
+	$(DOCKER) tag $(IMAGE):$(VERSION) $(IMAGE):latest
+	$(DOCKER) tag $(IMAGE):$(VERSION)-debug $(IMAGE):latest-debug
+	$(DOCKER) tag $(IMAGE):$(VERSION)-rootless $(IMAGE):latest-rootless
+
+.PHONY: push-latest
+push-latest:
+	$(DOCKER) push $(IMAGE):latest
+	$(DOCKER) push $(IMAGE):latest-debug
+	$(DOCKER) push $(IMAGE):latest-rootless
+
+.PHONY: push-binary-edge
+push-binary-edge:
+	aws s3 cp opa_darwin_$(GOARCH) s3://opa-releases/edge/opa_darwin_$(GOARCH)
+	aws s3 cp opa_windows_$(GOARCH).exe s3://opa-releases/edge/opa_windows_$(GOARCH).exe
+	aws s3 cp opa_linux_$(GOARCH) s3://opa-releases/edge/opa_linux_$(GOARCH)
+
+.PHONY: tag-edge
+tag-edge:
+	$(DOCKER) tag $(IMAGE):$(VERSION) $(IMAGE):edge
+	$(DOCKER) tag $(IMAGE):$(VERSION)-debug $(IMAGE):edge-debug
+	$(DOCKER) tag $(IMAGE):$(VERSION)-rootless $(IMAGE):edge-rootless
+
+.PHONY: push-edge
+push-edge:
+	$(DOCKER) push $(IMAGE):edge
+	$(DOCKER) push $(IMAGE):edge-debug
+	$(DOCKER) push $(IMAGE):edge-rootless
+
+.PHONY: docker-login
+docker-login:
+	@$(DOCKER) login -u ${DOCKER_USER} -p ${DOCKER_PASSWORD}
+
+.PHONY: push-image
+push-image: docker-login image-quick push
+
+.PHONY: deploy-travis
+deploy-travis: push-image tag-edge push-edge push-binary-edge
+
+.PHONY: release-travis
+release-travis: push-image tag-latest push-latest
+
+.PHONY: release-bugfix-travis
+release-bugfix-travis: deploy-travis
+
+.PHONY: fuzzer
+fuzzer:
+	docker build \
+		-f Dockerfile.fuzzit \
+		-t openpolicyagent/fuzzer:$(BUILD_COMMIT) \
+		--build-arg GOVERSION=$(GOVERSION) \
+		.
+
+.PHONY: docker-fuzzit-local-regression
+docker-fuzzit-local-regression: fuzzer
+	docker run \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		openpolicyagent/fuzzer:$(BUILD_COMMIT) \
+		./fuzzit create job --type "local-regression" opa/ast ast-fuzzer
+
+.PHONY: docker-fuzzit-fuzzing
+docker-fuzzit-fuzzing: fuzzer
+	@docker run \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-e FUZZIT_API_KEY=$(FUZZIT_API_KEY) \
+		openpolicyagent/fuzzer:$(BUILD_COMMIT) \
+		./fuzzit create job --type "fuzzing" opa/ast ast-fuzzer
+
+######################################################
+#
 # Release targets
 #
 ######################################################
 
-.PHONY: release-builder
-release-builder:
-	sed -e s/GOVERSION/$(GOVERSION)/g Dockerfile_release-builder.in > .Dockerfile_release-builder
-	docker build -f .Dockerfile_release-builder -t $(REPOSITORY)/release-builder:$(RELEASE_BUILDER_VERSION) -t $(REPOSITORY)/release-builder:latest .
-
-.PHONY: push-release-builder
-push-release-builder:
-	docker push $(REPOSITORY)/release-builder:latest
-	docker push $(REPOSITORY)/release-builder:$(RELEASE_BUILDER_VERSION)
-
 .PHONY: release
 release:
-	docker run -it --rm \
+	$(DOCKER) run -it --rm \
 		-v $(PWD)/_release/$(VERSION):/_release/$(VERSION) \
 		-v $(PWD):/_src \
-		$(REPOSITORY)/release-builder:$(RELEASE_BUILDER_VERSION) \
+		$(RELEASE_BUILD_IMAGE) \
 		/_src/build/build-release.sh --version=$(VERSION) --output-dir=/_release/$(VERSION) --source-url=/_src
 
 .PHONY: release-local
 release-local:
-	docker run -it --rm \
+	$(DOCKER) run -it --rm \
 		-v $(PWD)/_release/$(VERSION):/_release/$(VERSION) \
 		-v $(PWD):/_src \
-		$(REPOSITORY)/release-builder:$(RELEASE_BUILDER_VERSION) \
+		$(RELEASE_BUILD_IMAGE) \
 		/_src/build/build-release.sh --output-dir=/_release/$(VERSION) --source-url=/_src
 
 .PHONY: release-patch
 release-patch:
-	@docker run -it --rm \
+	@$(DOCKER) run -it --rm \
 		-e LAST_VERSION=$(LAST_VERSION) \
 		-v $(PWD):/_src \
 		python:2.7 \
@@ -221,7 +292,7 @@ release-patch:
 
 .PHONY: dev-patch
 dev-patch:
-	@docker run -it --rm \
+	@$(DOCKER) run -it --rm \
 		-v $(PWD):/_src \
 		python:2.7 \
 		/_src/build/gen-dev-patch.sh --version=$(VERSION) --source-url=/_src

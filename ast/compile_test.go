@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/open-policy-agent/opa/metrics"
+	"github.com/open-policy-agent/opa/types"
 	"github.com/open-policy-agent/opa/util"
 	"github.com/open-policy-agent/opa/util/test"
 )
@@ -664,7 +665,13 @@ p { true }`,
 		"mod6.rego": `package badrules.existserr
 
 p { true }`,
-	})
+		"mod7.rego": `package badrules.redeclaration
+
+p1 := 1
+p1 := 2
+
+p2 = 1
+p2 := 2`})
 
 	c.WithPathConflictsCheck(func(path []string) (bool, error) {
 		if reflect.DeepEqual(path, []string{"badrules", "dataoverlap", "p"}) {
@@ -687,6 +694,8 @@ p { true }`,
 		"rego_type_error: multiple default rules named foo found",
 		"rego_type_error: package badrules.r conflicts with rule defined at mod1.rego:7",
 		"rego_type_error: package badrules.r conflicts with rule defined at mod1.rego:8",
+		"rego_type_error: rule named p1 redeclared at mod7.rego:4",
+		"rego_type_error: rule named p2 redeclared at mod7.rego:7",
 	}
 
 	assertCompilerErrorStrings(t, c, expected)
@@ -2245,6 +2254,31 @@ dataref = true { data }`,
 	}
 }
 
+func TestCompilerCheckDynamicRecursion(t *testing.T) {
+	// This test tries to circumvent the recursion check by using dynamic
+	// references.  For more background info, see
+	// <https://github.com/open-policy-agent/opa/issues/1565>.
+	c := NewCompiler()
+	c.Modules = map[string]*Module{
+		"recursion": MustParseModule(`package recursion
+
+pkg = "recursion"
+
+foo[x] {
+  data[pkg]["foo"][x]
+}`),
+	}
+
+	compileStages(c, c.checkRecursion)
+
+	result := compilerErrsToStringSlice(c.Errors)
+	expected := "rego_recursion_error: rule foo is recursive: foo -> foo"
+
+	if len(result) != 1 || result[0] != expected {
+		t.Errorf("Expected %v but got: %v", expected, result)
+	}
+}
+
 func TestCompilerGetRulesExact(t *testing.T) {
 	mods := getCompilerTestModules()
 
@@ -2464,6 +2498,11 @@ q["b"] = 2 { true }`,
 	for _, tc := range tests {
 		test.Subtest(t, tc.input, func(t *testing.T) {
 			result := compiler.GetRules(MustParseRef(tc.input))
+
+			if len(result) != len(tc.expected) {
+				t.Fatalf("Expected %v but got: %v", tc.expected, result)
+			}
+
 			for i := range result {
 				found := false
 				for j := range tc.expected {
@@ -2479,6 +2518,119 @@ q["b"] = 2 { true }`,
 		})
 	}
 
+}
+
+func TestCompilerGetRulesDynamic(t *testing.T) {
+	compiler := getCompilerWithParsedModules(map[string]string{
+		"mod1": `package a.b.c.d
+r1 = 1`,
+		"mod2": `package a.b.c.e
+r2 = 2`,
+		"mod3": `package a.b
+r3 = 3`,
+	})
+
+	compileStages(compiler, nil)
+
+	rule1 := compiler.Modules["mod1"].Rules[0]
+	rule2 := compiler.Modules["mod2"].Rules[0]
+	rule3 := compiler.Modules["mod3"].Rules[0]
+
+	tests := []struct {
+		input    string
+		expected []*Rule
+	}{
+		{"data.a.b.c.d.r1", []*Rule{rule1}},
+		{"data.a.b[x]", []*Rule{rule1, rule2, rule3}},
+		{"data.a.b[x].d", []*Rule{rule1, rule3}},
+		{"data.a.b.c", []*Rule{rule1, rule2}},
+		{"data.a.b.d", nil},
+		{"data[x]", []*Rule{rule1, rule2, rule3}},
+		{"data[data.complex_computation].b[y]", []*Rule{rule1, rule2, rule3}},
+		{"data[x][y].c.e", []*Rule{rule2}},
+		{"data[x][y].r3", []*Rule{rule3}},
+	}
+
+	for _, tc := range tests {
+		test.Subtest(t, tc.input, func(t *testing.T) {
+			result := compiler.GetRulesDynamic(MustParseRef(tc.input))
+
+			if len(result) != len(tc.expected) {
+				t.Fatalf("Expected %v but got: %v", tc.expected, result)
+			}
+
+			for i := range result {
+				found := false
+				for j := range tc.expected {
+					if result[i].Equal(tc.expected[j]) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Fatalf("Expected %v but got: %v", tc.expected, result)
+				}
+			}
+		})
+	}
+
+}
+
+func TestCompileCustomBuiltins(t *testing.T) {
+
+	compiler := NewCompiler().WithBuiltins(map[string]*Builtin{
+		"baz": &Builtin{
+			Name: "baz",
+			Decl: types.NewFunction([]types.Type{types.S}, types.A),
+		},
+		"foo.bar": &Builtin{
+			Name: "foo.bar",
+			Decl: types.NewFunction([]types.Type{types.S}, types.A),
+		},
+	})
+
+	compiler.Compile(map[string]*Module{
+		"test.rego": MustParseModule(`
+			package test
+
+			p { baz("x") = x }
+			q { foo.bar("x") = x }
+		`),
+	})
+
+	// Ensure no type errors occur.
+	if compiler.Failed() {
+		t.Fatal("Unexpected compilation error:", compiler.Errors)
+	}
+
+	_, err := compiler.QueryCompiler().Compile(MustParseBody(`baz("x") = x; foo.bar("x") = x`))
+	if err != nil {
+		t.Fatal("Unexpected compilation error:", err)
+	}
+
+	// Ensure type errors occur.
+	exp1 := `rego_type_error: baz: invalid argument(s)`
+	exp2 := `rego_type_error: foo.bar: invalid argument(s)`
+
+	_, err = compiler.QueryCompiler().Compile(MustParseBody(`baz(1) = x; foo.bar(1) = x`))
+	if err == nil {
+		t.Fatal("Expected compilation error")
+	} else if !strings.Contains(err.Error(), exp1) {
+		t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp1, err)
+	} else if !strings.Contains(err.Error(), exp2) {
+		t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp2, err)
+	}
+
+	compiler.Compile(map[string]*Module{
+		"test.rego": MustParseModule(`
+			package test
+
+			p { baz(1) = x }  # type error
+			q { foo.bar(1) = x }  # type error
+		`),
+	})
+
+	assertCompilerErrorStrings(t, compiler, []string{exp1, exp2})
 }
 
 func TestCompilerLazyLoadingError(t *testing.T) {
@@ -2508,10 +2660,12 @@ import data.x.z1 as z2
 
 p = true { q; r }
 q = true { z2 }`)
+	orig1 := mod1.Copy()
 
 	mod2 := MustParseModule(`package a.b.c
 
 r = true { true }`)
+	orig2 := mod2.Copy()
 
 	mod3 := MustParseModule(`package x
 
@@ -2519,10 +2673,12 @@ import data.foo.bar
 import input.input
 
 z1 = true { [localvar | count(bar.baz.qux, localvar)] }`)
+	orig3 := mod3.Copy()
 
 	mod4 := MustParseModule(`package foo.bar.baz
 
 qux = grault { true }`)
+	orig4 := mod4.Copy()
 
 	mod5 := MustParseModule(`package foo.bar.baz
 
@@ -2530,6 +2686,7 @@ import data.d.e.f
 
 deadbeef = f { true }
 grault = deadbeef { true }`)
+	orig5 := mod5.Copy()
 
 	// testLoader will return 4 rounds of parsed modules.
 	rounds := []map[string]*Module{
@@ -2595,6 +2752,11 @@ grault = deadbeef { true }`)
 
 	if compiler.Compile(nil); compiler.Failed() {
 		t.Fatalf("Got unexpected error from compiler: %v", compiler.Errors)
+	}
+
+	// Check the original modules are still untouched.
+	if !mod1.Equal(orig1) || !mod2.Equal(orig2) || !mod3.Equal(orig3) || !mod4.Equal(orig4) || !mod5.Equal(orig5) {
+		t.Errorf("Compiler lazy loading modified the original modules")
 	}
 }
 
@@ -2843,6 +3005,17 @@ func TestQueryCompilerWithStageAfterWithMetrics(t *testing.T) {
 	}
 }
 
+func TestQueryCompilerWithUnsafeBuiltins(t *testing.T) {
+	c := NewCompiler().WithUnsafeBuiltins(map[string]struct{}{
+		"count": struct{}{},
+	})
+
+	_, err := c.QueryCompiler().WithUnsafeBuiltins(map[string]struct{}{}).Compile(MustParseBody("count([])"))
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func assertCompilerErrorStrings(t *testing.T, compiler *Compiler, expected []string) {
 	result := compilerErrsToStringSlice(compiler.Errors)
 
@@ -3050,4 +3223,32 @@ func runQueryCompilerTest(t *testing.T, note, q, pkg string, imports []string, e
 			}
 		}
 	})
+}
+
+func TestCompilerWithUnsafeBuiltins(t *testing.T) {
+	// Rego includes a number of built-in functions. In some cases, you may not
+	// want all builtins to be available to a program. This test shows how to
+	// mark a built-in as unsafe.
+	compiler := NewCompiler().WithUnsafeBuiltins(map[string]struct{}{"re_match": struct{}{}})
+
+	// This query should not compile because the `re_match` built-in is no
+	// longer available.
+	_, err := compiler.QueryCompiler().Compile(MustParseBody(`re_match("a", "a")`))
+	if err == nil {
+		t.Fatalf("Expected error for unsafe built-in")
+	} else if !strings.Contains(err.Error(), "unsafe built-in function") {
+		t.Fatalf("Expected error for unsafe built-in but got %v", err)
+	}
+
+	// These modules should not compile for the same reason.
+	modules := map[string]*Module{"mod1": MustParseModule(`package a.b.c
+deny {
+    re_match(input.user, ".*bob.*")
+}`)}
+	compiler.Compile(modules)
+	if !compiler.Failed() {
+		t.Fatalf("Expected error for unsafe built-in")
+	} else if !strings.Contains(compiler.Errors[0].Error(), "unsafe built-in function") {
+		t.Fatalf("Expected error for unsafe built-in but got %v", err)
+	}
 }

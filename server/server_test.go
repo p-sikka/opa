@@ -21,13 +21,11 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/bundle"
-	"github.com/open-policy-agent/opa/internal/manifest"
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/plugins"
 	pluginBundle "github.com/open-policy-agent/opa/plugins/bundle"
@@ -74,30 +72,111 @@ func TestUnversionedGetHealthBundleNoBundleSet(t *testing.T) {
 	}
 }
 
-func TestUnversionedGetHealthCheckBundleActivation(t *testing.T) {
+func TestUnversionedGetHealthCheckBundleActivationSingle(t *testing.T) {
 
 	f := newFixture(t)
+	bundleName := "test-bundle"
 
 	// Initialize the server as if a bundle plugin was
 	// configured on the manager.
-	f.server.hasBundle = true
-	f.server.bundleStatusMtx = new(sync.RWMutex)
+	f.server.manager.Register(pluginBundle.Name, &pluginBundle.Plugin{})
+	f.server.bundleStatuses = map[string]*pluginBundle.Status{
+		bundleName: &pluginBundle.Status{Name: bundleName},
+	}
 
-	// The bundle hasnt been activated yet, expect it to be activated
+	// The bundle hasn't been activated yet, expect the health check to fail
 	req := newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
 	if err := f.executeRequest(req, 500, `{}`); err != nil {
-		t.Fatalf("Unexpected error while health check: %v", err)
+		t.Fatal(err)
 	}
 
 	// Set the bundle to be activated.
-	status := pluginBundle.Status{}
-	status.SetActivateSuccess("")
+	status := map[string]*pluginBundle.Status{
+		bundleName: &pluginBundle.Status{},
+	}
+	status[bundleName].SetActivateSuccess("")
 	f.server.updateBundleStatus(status)
 
 	// The heath check should now respond as healthy
 	req = newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
 	if err := f.executeRequest(req, 200, `{}`); err != nil {
-		t.Fatalf("Unexpected error while health check: %v", err)
+		t.Fatal(err)
+	}
+}
+
+func TestUnversionedGetHealthCheckBundleActivationSingleLegacy(t *testing.T) {
+
+	// Initialize the server as if there is no bundle plugin
+
+	f := newFixture(t)
+
+	ctx := context.Background()
+
+	err := storage.Txn(ctx, f.server.store, storage.WriteParams, func(txn storage.Transaction) error {
+		return bundle.LegacyWriteManifestToStore(ctx, f.server.store, txn, bundle.Manifest{
+			Revision: "a",
+		})
+	})
+
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	// The heath check should now respond as healthy
+	req := newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
+	if err := f.executeRequest(req, 200, `{}`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnversionedGetHealthCheckBundleActivationMulti(t *testing.T) {
+
+	f := newFixture(t)
+
+	// Initialize the server as if a bundle plugin was
+	// configured on the manager.
+	bp := pluginBundle.New(&pluginBundle.Config{Bundles: map[string]*pluginBundle.Source{
+		"b1": {Service: "s1", Resource: "bundle.tar.gz"},
+		"b2": {Service: "s2", Resource: "bundle.tar.gz"},
+		"b3": {Service: "s3", Resource: "bundle.tar.gz"},
+	}}, f.server.manager)
+	f.server.manager.Register(pluginBundle.Name, bp)
+	f.server.bundleStatuses = map[string]*pluginBundle.Status{
+		"b1": {Name: "b1"},
+		"b2": {Name: "b2"},
+		"b3": {Name: "b3"},
+	}
+
+	// No bundle has been activated yet, expect the health check to fail
+	req := newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
+	if err := f.executeRequest(req, 500, `{}`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set one bundle to be activated
+	update := map[string]*pluginBundle.Status{
+		"b1": {Name: "b1"},
+		"b2": {Name: "b2"},
+		"b3": {Name: "b3"},
+	}
+	update["b2"].SetActivateSuccess("A")
+	f.server.updateBundleStatus(update)
+
+	// The heath check should still respond as unhealthy
+	req = newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
+	if err := f.executeRequest(req, 500, `{}`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Activate all the bundles
+	update["b1"].SetActivateSuccess("B")
+	update["b3"].SetActivateSuccess("C")
+	f.server.updateBundleStatus(update)
+
+	// The heath check should succeed now
+	req = newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
+	if err := f.executeRequest(req, 200, `{}`); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -108,7 +187,14 @@ func TestInitWithBundlePlugin(t *testing.T) {
 		t.Fatalf("Unexpected error creating plugin manager: %s", err.Error())
 	}
 
-	m.Register(pluginBundle.Name, new(pluginBundle.Plugin))
+	bundleName := "test-bundle"
+	bundleConf := &pluginBundle.Config{
+		Name:    bundleName,
+		Service: "s1",
+		Bundles: map[string]*pluginBundle.Source{"b1": {}},
+	}
+
+	m.Register(pluginBundle.Name, pluginBundle.New(bundleConf, m))
 
 	server, err := New().
 		WithStore(store).
@@ -119,15 +205,45 @@ func TestInitWithBundlePlugin(t *testing.T) {
 		t.Fatalf("Unexpected error initializing server: %s", err.Error())
 	}
 
-	if server.hasBundle == false {
+	if !server.hasBundle() {
 		t.Error("server.hasBundle should be true")
 	}
 
-	if server.bundleStatusMtx == nil {
-		t.Error("server.bundleStatusMtx should be initialized")
+	isActivated := server.bundlesActivated()
+	if isActivated {
+		t.Error("bundle should not be initialized to activated status")
+	}
+}
+
+func TestInitWithBundlePluginMultiBundle(t *testing.T) {
+	store := inmem.New()
+	m, err := plugins.New([]byte{}, "test", store)
+	if err != nil {
+		t.Fatalf("Unexpected error creating plugin manager: %s", err.Error())
 	}
 
-	isActivated := server.bundleActivated()
+	bundleConf := &pluginBundle.Config{Bundles: map[string]*pluginBundle.Source{
+		"b1": {},
+		"b2": {},
+		"b3": {},
+	}}
+
+	m.Register(pluginBundle.Name, pluginBundle.New(bundleConf, m))
+
+	server, err := New().
+		WithStore(store).
+		WithManager(m).
+		Init(context.Background())
+
+	if err != nil {
+		t.Fatalf("Unexpected error initializing server: %s", err.Error())
+	}
+
+	if !server.hasBundle() {
+		t.Error("server.hasBundle should be true")
+	}
+
+	isActivated := server.bundlesActivated()
 	if isActivated {
 		t.Error("bundle should not be initialized to activated")
 	}
@@ -434,7 +550,18 @@ func TestCompileV1UnsafeBuiltin(t *testing.T) {
 	query := `{"query": "http.send({\"method\": \"get\", \"url\": \"foo.com\"}, x)"}`
 	expResp := `{
   "code": "invalid_parameter",
-  "message": "unsafe built-in function calls in query: http.send"
+  "message": "error(s) occurred while compiling module(s)",
+  "errors": [
+    {
+      "code": "rego_type_error",
+      "message": "unsafe built-in function calls in expression: http.send",
+      "location": {
+        "file": "",
+        "row": 1,
+        "col": 1
+      }
+    }
+  ]
 }`
 
 	if err := f.v1(http.MethodPost, `/compile`, query, 400, expResp); err != nil {
@@ -949,7 +1076,7 @@ func TestBundleScope(t *testing.T) {
 
 	txn := storage.NewTransactionOrDie(ctx, f.server.store, storage.WriteParams)
 
-	if err := manifest.Write(ctx, f.server.store, txn, bundle.Manifest{
+	if err := bundle.WriteManifestToStore(ctx, f.server.store, txn, "test-bundle", bundle.Manifest{
 		Revision: "AAAAA",
 		Roots:    &[]string{"a/b/c", "x/y"},
 	}); err != nil {
@@ -970,47 +1097,112 @@ func TestBundleScope(t *testing.T) {
 			path:   "/data/a/b",
 			body:   "1",
 			code:   http.StatusBadRequest,
-			resp:   `{"code": "invalid_parameter", "message": "path a/b is owned by bundle"}`,
+			resp:   `{"code": "invalid_parameter", "message": "path a/b is owned by bundle \"test-bundle\""}`,
 		},
 		{
 			method: "PUT",
 			path:   "/data/a/b/c",
 			body:   "1",
 			code:   http.StatusBadRequest,
-			resp:   `{"code": "invalid_parameter", "message": "path a/b/c is owned by bundle"}`,
+			resp:   `{"code": "invalid_parameter", "message": "path a/b/c is owned by bundle \"test-bundle\""}`,
 		},
 		{
 			method: "PUT",
 			path:   "/data/a/b/c/d",
 			body:   "1",
 			code:   http.StatusBadRequest,
-			resp:   `{"code": "invalid_parameter", "message": "path a/b/c/d is owned by bundle"}`,
+			resp:   `{"code": "invalid_parameter", "message": "path a/b/c/d is owned by bundle \"test-bundle\""}`,
 		},
 		{
 			method: "PATCH",
 			path:   "/data/a",
 			body:   `[{"path": "/b/c", "op": "add", "value": 1}]`,
 			code:   http.StatusBadRequest,
-			resp:   `{"code": "invalid_parameter", "message": "path a/b/c is owned by bundle"}`,
+			resp:   `{"code": "invalid_parameter", "message": "path a/b/c is owned by bundle \"test-bundle\""}`,
 		},
 		{
 			method: "DELETE",
 			path:   "/data/a",
 			code:   http.StatusBadRequest,
-			resp:   `{"code": "invalid_parameter", "message": "path a is owned by bundle"}`,
+			resp:   `{"code": "invalid_parameter", "message": "path a is owned by bundle \"test-bundle\""}`,
 		},
 		{
 			method: "PUT",
 			path:   "/policies/test1",
 			body:   `package a.b`,
 			code:   http.StatusBadRequest,
-			resp:   `{"code": "invalid_parameter", "message": "path a/b is owned by bundle"}`,
+			resp:   `{"code": "invalid_parameter", "message": "path a/b is owned by bundle \"test-bundle\""}`,
 		},
 		{
 			method: "DELETE",
 			path:   "/policies/someid",
 			code:   http.StatusBadRequest,
-			resp:   `{"code": "invalid_parameter", "message": "path x/y/z is owned by bundle"}`,
+			resp:   `{"code": "invalid_parameter", "message": "path x/y/z is owned by bundle \"test-bundle\""}`,
+		},
+		{
+			method: "PUT",
+			path:   "/data/foo/bar",
+			body:   "1",
+			code:   http.StatusNoContent,
+		},
+	}
+
+	if err := f.v1TestRequests(cases); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBundleScopeMultiBundle(t *testing.T) {
+
+	ctx := context.Background()
+
+	f := newFixture(t)
+
+	txn := storage.NewTransactionOrDie(ctx, f.server.store, storage.WriteParams)
+
+	if err := bundle.WriteManifestToStore(ctx, f.server.store, txn, "test-bundle1", bundle.Manifest{
+		Revision: "AAAAA",
+		Roots:    &[]string{"a/b/c", "x/y"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := bundle.WriteManifestToStore(ctx, f.server.store, txn, "test-bundle2", bundle.Manifest{
+		Revision: "AAAAA",
+		Roots:    &[]string{"a/b/d"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := bundle.WriteManifestToStore(ctx, f.server.store, txn, "test-bundle3", bundle.Manifest{
+		Revision: "AAAAA",
+		Roots:    &[]string{"a/b/e", "a/b/f"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.server.store.UpsertPolicy(ctx, txn, "someid", []byte(`package x.y.z`)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.server.store.Commit(ctx, txn); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []tr{
+		{
+			method: "PUT",
+			path:   "/data/x/y",
+			body:   "1",
+			code:   http.StatusBadRequest,
+			resp:   `{"code": "invalid_parameter", "message": "path x/y is owned by bundle \"test-bundle1\""}`,
+		},
+		{
+			method: "PUT",
+			path:   "/data/a/b/d",
+			body:   "1",
+			code:   http.StatusBadRequest,
+			resp:   `{"code": "invalid_parameter", "message": "path a/b/d is owned by bundle \"test-bundle2\""}`,
 		},
 		{
 			method: "PUT",
@@ -1470,7 +1662,7 @@ func TestDataPostExplainNotes(t *testing.T) {
 	}
 }
 
-func TestDataProvenance(t *testing.T) {
+func TestDataProvenanceSingleBundle(t *testing.T) {
 
 	f := newFixture(t)
 
@@ -1480,6 +1672,13 @@ func TestDataProvenance(t *testing.T) {
 	version.Vcs = "ac23eb45"
 	version.Timestamp = "today"
 	version.Hostname = "foo.bar.com"
+
+	// Initialize as if a bundle plugin is running
+	bp := pluginBundle.New(&pluginBundle.Config{Name: "b1"}, f.server.manager)
+	f.server.manager.Register(pluginBundle.Name, bp)
+	f.server.bundleStatuses = map[string]*pluginBundle.Status{
+		"b1": {Name: "b1"},
+	}
 
 	req := newReqV1(http.MethodPost, "/data?provenance", "")
 	f.reset()
@@ -1493,6 +1692,181 @@ func TestDataProvenance(t *testing.T) {
 
 	if result.Provenance == nil {
 		t.Fatalf("Expected non-nil provenance: %v", result.Provenance)
+	}
+
+	expectedProvenance := &types.ProvenanceV1{
+		Version:   version.Version,
+		Vcs:       version.Vcs,
+		Timestamp: version.Timestamp,
+		Hostname:  version.Hostname,
+	}
+
+	if !reflect.DeepEqual(result.Provenance, expectedProvenance) {
+		t.Errorf("Unexpected provenance data: \n\n%+v\n\nExpected:\n%+v\n\n", result.Provenance, expectedProvenance)
+	}
+
+	// Update bundle revision and request again
+	f.server.revisions["b1"] = "r1"
+	f.server.legacyRevision = "r1"
+
+	req = newReqV1(http.MethodPost, "/data?provenance", "")
+	f.reset()
+	f.server.Handler.ServeHTTP(f.recorder, req)
+
+	result = types.DataResponseV1{}
+
+	if err := util.NewJSONDecoder(f.recorder.Body).Decode(&result); err != nil {
+		t.Fatalf("Unexpected JSON decode error: %v", err)
+	}
+
+	if result.Provenance == nil {
+		t.Fatalf("Expected non-nil provenance: %v", result.Provenance)
+	}
+
+	expectedProvenance.Revision = "r1"
+	if !reflect.DeepEqual(result.Provenance, expectedProvenance) {
+		t.Errorf("Unexpected provenance data: \n\n%+v\n\nExpected:\n%+v\n\n", result.Provenance, expectedProvenance)
+	}
+}
+
+func TestDataProvenanceSingleFileBundle(t *testing.T) {
+
+	f := newFixture(t)
+
+	// Dummy up since we are not using ld...
+	// Note:  No bundle 'revision'...
+	version.Version = "0.10.7"
+	version.Vcs = "ac23eb45"
+	version.Timestamp = "today"
+	version.Hostname = "foo.bar.com"
+
+	// No bundle plugin initialized, just a legacy revision set
+	f.server.legacyRevision = "r1"
+
+	req := newReqV1(http.MethodPost, "/data?provenance", "")
+	f.reset()
+	f.server.Handler.ServeHTTP(f.recorder, req)
+
+	result := types.DataResponseV1{}
+
+	if err := util.NewJSONDecoder(f.recorder.Body).Decode(&result); err != nil {
+		t.Fatalf("Unexpected JSON decode error: %v", err)
+	}
+
+	if result.Provenance == nil {
+		t.Fatalf("Expected non-nil provenance: %v", result.Provenance)
+	}
+
+	expectedProvenance := &types.ProvenanceV1{
+		Version:   version.Version,
+		Vcs:       version.Vcs,
+		Timestamp: version.Timestamp,
+		Hostname:  version.Hostname,
+	}
+
+	expectedProvenance.Revision = "r1"
+	if !reflect.DeepEqual(result.Provenance, expectedProvenance) {
+		t.Errorf("Unexpected provenance data: \n\n%+v\n\nExpected:\n%+v\n\n", result.Provenance, expectedProvenance)
+	}
+}
+
+func TestDataProvenanceMultiBundle(t *testing.T) {
+
+	f := newFixture(t)
+
+	// Dummy up since we are not using ld...
+	version.Version = "0.10.7"
+	version.Vcs = "ac23eb45"
+	version.Timestamp = "today"
+	version.Hostname = "foo.bar.com"
+
+	// Initialize as if a bundle plugin is running with 2 bundles
+	bp := pluginBundle.New(&pluginBundle.Config{Bundles: map[string]*pluginBundle.Source{
+		"b1": {Service: "s1", Resource: "bundle.tar.gz"},
+		"b2": {Service: "s2", Resource: "bundle.tar.gz"},
+	}}, f.server.manager)
+	f.server.manager.Register(pluginBundle.Name, bp)
+
+	f.server.bundleStatuses = map[string]*pluginBundle.Status{
+		"b1": {Name: "b1"},
+		"b2": {Name: "b2"},
+	}
+
+	req := newReqV1(http.MethodPost, "/data?provenance", "")
+	f.reset()
+	f.server.Handler.ServeHTTP(f.recorder, req)
+
+	var result types.DataResponseV1
+
+	if err := util.NewJSONDecoder(f.recorder.Body).Decode(&result); err != nil {
+		t.Fatalf("Unexpected JSON decode error: %v", err)
+	}
+
+	if result.Provenance == nil {
+		t.Fatalf("Expected non-nil provenance: %v", result.Provenance)
+	}
+
+	expectedProvenance := &types.ProvenanceV1{
+		Version:   version.Version,
+		Vcs:       version.Vcs,
+		Timestamp: version.Timestamp,
+		Hostname:  version.Hostname,
+	}
+
+	if !reflect.DeepEqual(result.Provenance, expectedProvenance) {
+		t.Errorf("Unexpected provenance data: \n\n%+v\n\nExpected:\n%+v\n\n", result.Provenance, expectedProvenance)
+	}
+
+	// Update bundle revision for a single bundle and make the request again
+	f.server.revisions["b1"] = "r1"
+
+	req = newReqV1(http.MethodPost, "/data?provenance", "")
+	f.reset()
+	f.server.Handler.ServeHTTP(f.recorder, req)
+
+	result = types.DataResponseV1{}
+
+	if err := util.NewJSONDecoder(f.recorder.Body).Decode(&result); err != nil {
+		t.Fatalf("Unexpected JSON decode error: %v", err)
+	}
+
+	if result.Provenance == nil {
+		t.Fatalf("Expected non-nil provenance: %v", result.Provenance)
+	}
+
+	expectedProvenance.Bundles = map[string]types.ProvenanceBundleV1{
+		"b1": {Revision: "r1"},
+	}
+
+	if !reflect.DeepEqual(result.Provenance, expectedProvenance) {
+		t.Errorf("Unexpected provenance data: \n\n%+v\n\nExpected:\n%+v\n\n", result.Provenance, expectedProvenance)
+	}
+
+	// Update both and check again
+	f.server.revisions["b1"] = "r2"
+	f.server.revisions["b2"] = "r1"
+
+	req = newReqV1(http.MethodPost, "/data?provenance", "")
+	f.reset()
+	f.server.Handler.ServeHTTP(f.recorder, req)
+
+	result = types.DataResponseV1{}
+
+	if err := util.NewJSONDecoder(f.recorder.Body).Decode(&result); err != nil {
+		t.Fatalf("Unexpected JSON decode error: %v", err)
+	}
+
+	if result.Provenance == nil {
+		t.Fatalf("Expected non-nil provenance: %v", result.Provenance)
+	}
+
+	expectedProvenance.Bundles = map[string]types.ProvenanceBundleV1{
+		"b1": {Revision: "r2"},
+		"b2": {Revision: "r1"},
+	}
+
+	if !reflect.DeepEqual(result.Provenance, expectedProvenance) {
+		t.Errorf("Unexpected provenance data: \n\n%+v\n\nExpected:\n%+v\n\n", result.Provenance, expectedProvenance)
 	}
 }
 
@@ -1913,7 +2287,6 @@ func TestQueryPostBasic(t *testing.T) {
 		WithAddresses([]string{":8182"}).
 		WithStore(f.server.store).
 		WithManager(f.server.manager).
-		WithDiagnosticsBuffer(NewBoundedBuffer(8)).
 		Init(context.Background())
 
 	setup := []tr{
@@ -2188,263 +2561,34 @@ func TestQueryWatchMigrateInvalidate(t *testing.T) {
 	}
 }
 
-func TestDiagnostics(t *testing.T) {
-	f := newFixture(t)
-	f.server, _ = New().
-		WithAddresses([]string{":8182"}).
-		WithStore(f.server.store).
-		WithManager(f.server.manager).
-		WithDiagnosticsBuffer(NewBoundedBuffer(8)).
-		Init(context.Background())
-
-	queriesOnly := `package system.diagnostics
-
-	default config = {"mode": "off"}
-
-	config = {"mode": "on"} {
-		input.path = "/v1/query"
-	}`
-
-	setup := []tr{
-		{http.MethodPut, "/data", `{"foo": "bar", "y": 7, "x": [1, 2, 3], "bar": null}`, 204, ""},
-		{http.MethodPut, "/policies/main", "package system\nmain = \"foo\"", 200, ""},
-
-		// Diagnostics should be disabled by default.
-		{http.MethodGet, "/data/y", "", 200, `{"result":7}`},
-		{http.MethodPost, "/data/y", "", 200, `{"result":7}`},
-		{http.MethodGet, "/query?q=a=data.y", "", 200, `{"result":[{"a":7}]}`},
-
-		// We should only get back metrics.
-		{http.MethodPut, "/policies/diagnostics", "package system.diagnostics\nconfig = {\"mode\": \"on\"}", 200, ""},
-		{http.MethodGet, "/data/y", "", 200, `{"result":7}`}, // This one should fall off the ring buffer.
-		{http.MethodGet, "/data/x", "", 200, `{"result":[1,2,3]}`},
-		{http.MethodPost, "/data/x", `{"input":{"test":"foo"}}`, 200, `{"result":[1,2,3]}`},
-		{http.MethodGet, "/query?q=a=data.x", "", 200, `{"result":[{"a":[1,2,3]}]}`},
-
-		// We should get back everything.
-		{http.MethodPut, "/policies/diagnostics", "package system.diagnostics\nconfig = {\"mode\": \"all\"}", 200, ""},
-		{http.MethodGet, "/data/x", "", 200, `{"result":[1,2,3]}`},
-		{http.MethodPost, "/data/z", "", 200, ``},
-		{http.MethodGet, "/query?q=a=data.x", "", 200, `{"result":[{"a":[1,2,3]}]}`},
-
-		// We should get back nothing.
-		{http.MethodPut, "/policies/diagnostics", "package system.diagnostics\nconfig = {\"mode\": \"off\"}", 200, ""},
-		{http.MethodGet, "/data/x", "", 200, `{"result":[1,2,3]}`},
-		{http.MethodPost, "/data/x", "", 200, `{"result":[1,2,3]}`},
-		{http.MethodGet, "/query?q=a=data.x", "", 200, `{"result":[{"a":[1,2,3]}]}`},
-
-		// We should get back only the query request.
-		{http.MethodPut, "/policies/diagnostics", queriesOnly, 200, ""},
-		{http.MethodGet, "/data/y", "", 200, `{"result":7}`},
-		{http.MethodPost, "/data/y", "", 200, `{"result":7}`},
-		{http.MethodGet, "/query?q=a=data.y", "", 200, `{"result":[{"a":7}]}`},
-
-		// We should get back the results of the webhook.
-		{http.MethodPut, "/policies/diagnostics", "package system.diagnostics\nconfig = {\"mode\": \"on\"}", 200, ""},
-	}
-
-	for _, tr := range setup {
-
-		req := newReqV1(tr.method, tr.path, tr.body)
-		req.RemoteAddr = "testaddr"
-
-		if err := f.executeRequest(req, tr.code, tr.resp); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	get := newReqUnversioned(http.MethodPost, `/`, "")
-	if err := f.executeRequest(get, 200, `"foo"`); err != nil {
-		t.Fatal(err)
-	}
-
-	expList := interface{}([]interface{}{json.Number("1"), json.Number("2"), json.Number("3")})
-	expMap1 := interface{}([]interface{}{map[string]interface{}{"a": expList}})
-	expMap2 := interface{}([]interface{}{map[string]interface{}{"a": json.Number("7")}})
-	expStr := interface{}("foo")
-
-	exp := []struct {
-		remoteAddr string
-		query      string
-		path       string
-		input      interface{}
-		result     *interface{}
-		metrics    bool
-		instrument bool
-		explainLen int
-	}{
-		{
-			remoteAddr: "testaddr",
-			path:       "data.x",
-			result:     &expList,
-			metrics:    true,
-		},
-		{
-			path:    "data.x",
-			input:   map[string]interface{}{"test": "foo"},
-			result:  &expList,
-			metrics: true,
-		},
-		{
-			query:   "a = data.x",
-			result:  &expMap1,
-			metrics: true,
-		},
-		{
-			path:       "data.x",
-			result:     &expList,
-			metrics:    true,
-			instrument: true,
-			explainLen: 5,
-		},
-		{
-			path:       "data.z",
-			result:     nil,
-			metrics:    true,
-			instrument: true,
-			explainLen: 3,
-		},
-		{
-			query:      "a = data.x",
-			result:     &expMap1,
-			metrics:    true,
-			instrument: true,
-			explainLen: 5,
-		},
-		{
-			query:  "a = data.y",
-			result: &expMap2,
-		},
-		{
-			path:   "data.system.main",
-			result: &expStr,
-		},
-	}
-
-	get = newReqV1(http.MethodGet, `/data/system/diagnostics`, "")
-	f.reset()
-	f.server.Handler.ServeHTTP(f.recorder, get)
-
-	var resp types.DiagnosticsResponseV1
-	decoder := util.NewJSONDecoder(f.recorder.Body)
-	if err := decoder.Decode(&resp); err != nil {
-		t.Fatal(err)
-	}
-
-	if len(resp.Result) != len(exp) {
-		t.Fatalf("Expected %d diagnostics, got %d", len(exp), len(resp.Result))
-	}
-
-	for i, d := range resp.Result {
-		test.Subtest(t, fmt.Sprint(i), func(t *testing.T) {
-			e := exp[i]
-			if e.query != d.Query {
-				t.Fatalf("Expected query to be %v, got %v", e.query, d.Query)
-			} else if e.path != d.Path {
-				t.Fatalf("Expected query to be %v, got %v", e.query, d.Query)
-			}
-
-			if !reflect.DeepEqual(e.input, d.Input) {
-				t.Fatalf("Expected input to be %v, got %v", e.input, d.Input)
-			}
-
-			if !reflect.DeepEqual(e.result, d.Result) {
-				t.Fatalf("Expected result to be %v but got: %v", e.result, d.Result)
-			}
-
-			if e.metrics {
-				if len(d.Metrics) == 0 {
-					t.Fatal("Expected metrics")
-				}
-			}
-
-			if e.instrument {
-				found := false
-				for k := range d.Metrics {
-					if strings.Contains(k, "eval_op_plug") {
-						found = true
-						break
-					}
-				}
-				if !found {
-					t.Fatalf("Expected to find instrumentation result: %v", d.Metrics)
-				}
-			}
-
-			var trace types.TraceV1Raw
-			if d.Explanation != nil {
-				if err := trace.UnmarshalJSON(d.Explanation); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			if len(trace) != e.explainLen {
-				t.Fatalf("Expected explanation of length %d, got %d", e.explainLen, len(trace))
-			}
-		})
-	}
+type mockDecisionBuffer struct {
+	decisions []*Info
 }
 
-func TestMetricsEndpoint(t *testing.T) {
+func (t *mockDecisionBuffer) Push(info *Info) {
+	t.decisions = append(t.decisions, info)
+}
 
-	f := newFixture(t)
-
-	module := `package test
-
-	p = true`
-
-	err := f.v1TestRequests([]tr{
-		{"PUT", "/policies/test", module, http.StatusOK, "{}"},
-		{"POST", "/data/test/p", "", http.StatusOK, `{"result": true}`},
-	})
-
-	if err != nil {
-		t.Fatal(err)
+func (t *mockDecisionBuffer) Iter(iter func(*Info)) {
+	for i := range t.decisions {
+		iter(t.decisions[i])
 	}
-
-	f.reset()
-
-	metricsRequest, err := http.NewRequest("GET", "/metrics", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	f.server.Handler.ServeHTTP(f.recorder, metricsRequest)
-
-	resp := f.recorder.Body.String()
-
-	expected := []string{
-		`http_request_duration_seconds_count{code="200",handler="v1/policies",method="put"} 1`,
-		`http_request_duration_seconds_count{code="200",handler="v1/data",method="post"} 1`,
-	}
-
-	for _, exp := range expected {
-		if !strings.Contains(resp, exp) {
-			t.Fatalf("Expected to find %q but got:\n\n%v", exp, resp)
-		}
-	}
-
 }
 
 func TestDecisionIDs(t *testing.T) {
+
 	f := newFixture(t)
-	f.server = f.server.WithDiagnosticsBuffer(NewBoundedBuffer(4))
+
+	ids := []string{}
 	ctr := 0
 
-	f.server = f.server.WithDecisionIDFactory(func() string {
+	f.server = f.server.WithDecisionLoggerWithErr(func(_ context.Context, info *Info) error {
+		ids = append(ids, info.DecisionID)
+		return nil
+	}).WithDecisionIDFactory(func() string {
 		ctr++
 		return fmt.Sprint(ctr)
 	})
-
-	enableDiagnostics := `
-		package system.diagnostics
-
-		config = {"mode": "on"}
-	`
-
-	if err := f.v1("PUT", "/policies/test", enableDiagnostics, 200, "{}"); err != nil {
-		t.Fatal(err)
-	}
 
 	if err := f.v1("GET", "/data/undefined", "", 200, `{"decision_id": "1"}`); err != nil {
 		t.Fatal(err)
@@ -2462,19 +2606,10 @@ func TestDecisionIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	infos := []*Info{}
-	ctr = 0
+	exp := []string{"1", "2", "3", "4"}
 
-	f.server.diagnostics.Iter(func(info *Info) {
-		ctr++
-		if info.DecisionID != fmt.Sprint(ctr) {
-			t.Fatalf("Expected decision ID to be %v but got: %v", ctr, info.DecisionID)
-		}
-		infos = append(infos, info)
-	})
-
-	if len(infos) != 4 {
-		t.Fatalf("Expected exactly 4 elements but got: %v", infos)
+	if !reflect.DeepEqual(ids, exp) {
+		t.Fatalf("Expected %v but got %v", exp, ids)
 	}
 }
 
@@ -2655,6 +2790,22 @@ func TestDecisionLogging(t *testing.T) {
 		}
 	}
 
+}
+
+func TestDecisionLogErrorMessage(t *testing.T) {
+
+	f := newFixture(t)
+
+	f.server.WithDecisionLoggerWithErr(func(context.Context, *Info) error {
+		return fmt.Errorf("xxx")
+	})
+
+	if err := f.v1(http.MethodPost, "/data", "", 500, `{
+		"code": "internal_error",
+		"message": "decision_logs: xxx"
+	}`); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestWatchParams(t *testing.T) {
@@ -2893,7 +3044,18 @@ func TestQueryV1UnsafeBuiltin(t *testing.T) {
 
 	expected := `{
   "code": "invalid_parameter",
-  "message": "unsafe built-in function calls in query: http.send"
+  "message": "error(s) occurred while compiling query",
+  "errors": [
+    {
+      "code": "rego_type_error",
+      "message": "unsafe built-in function calls in expression: http.send",
+      "location": {
+        "file": "",
+        "row": 1,
+        "col": 1
+      }
+    }
+  ]
 }`
 
 	if err := f.v1(http.MethodGet, query, "", 400, expected); err != nil {
@@ -3175,7 +3337,7 @@ type fixture struct {
 	t        *testing.T
 }
 
-func newFixture(t *testing.T) *fixture {
+func newFixture(t *testing.T, opts ...func(*Server)) *fixture {
 	ctx := context.Background()
 	store := inmem.New()
 	m, err := plugins.New([]byte{}, "test", store)
@@ -3187,11 +3349,14 @@ func newFixture(t *testing.T) *fixture {
 		panic(err)
 	}
 
-	server, err := New().
+	server := New().
 		WithAddresses([]string{":8182"}).
 		WithStore(store).
-		WithManager(m).
-		Init(ctx)
+		WithManager(m)
+	for _, opt := range opts {
+		opt(server)
+	}
+	server, err = server.Init(ctx)
 	if err != nil {
 		panic(err)
 	}

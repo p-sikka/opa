@@ -80,7 +80,6 @@ const (
 	MsgUnauthorizedUndefinedError = "authorization policy missing or undefined"
 	MsgUnauthorizedError          = "request rejected by administrative policy"
 	MsgUndefinedError             = "document missing or undefined"
-	MsgDiagnosticsDisabled        = "diagnostics are not enabled"
 	MsgPluginConfigError          = "error(s) occurred while configuring plugin(s)"
 )
 
@@ -91,7 +90,7 @@ type PatchV1 struct {
 	Value interface{} `json:"value"`
 }
 
-// PolicyListResponseV1 models the response mesasge for the Policy API list operation.
+// PolicyListResponseV1 models the response message for the Policy API list operation.
 type PolicyListResponseV1 struct {
 	Result []PolicyV1 `json:"result"`
 }
@@ -125,11 +124,17 @@ func (p PolicyV1) Equal(other PolicyV1) bool {
 
 // ProvenanceV1 models a collection of build/version information.
 type ProvenanceV1 struct {
-	Version   string `json:"version"`
-	Vcs       string `json:"build_commit"`
-	Timestamp string `json:"build_timestamp"`
-	Hostname  string `json:"build_hostname"`
-	Revision  string `json:"revision,omitempty"`
+	Version   string                        `json:"version"`
+	Vcs       string                        `json:"build_commit"`
+	Timestamp string                        `json:"build_timestamp"`
+	Hostname  string                        `json:"build_hostname"`
+	Revision  string                        `json:"revision,omitempty"` // Deprecated: Prefer `Bundles`
+	Bundles   map[string]ProvenanceBundleV1 `json:"bundles,omitempty"`
+}
+
+// ProvenanceBundleV1 models a bundle at some point in time
+type ProvenanceBundleV1 struct {
+	Revision string `json:"revision"`
 }
 
 // DataRequestV1 models the request message for Data API POST operations.
@@ -144,27 +149,6 @@ type DataResponseV1 struct {
 	Explanation TraceV1       `json:"explanation,omitempty"`
 	Metrics     MetricsV1     `json:"metrics,omitempty"`
 	Result      *interface{}  `json:"result,omitempty"`
-}
-
-// DiagnosticsResponseV1 models the response message for diagnostics reads.
-type DiagnosticsResponseV1 struct {
-	Result []DiagnosticsResponseElementV1 `json:"result"`
-}
-
-// DiagnosticsResponseElementV1 models an element in the response message for the
-// Diagnostics API.
-type DiagnosticsResponseElementV1 struct {
-	Revision    string       `json:"revision,omitempty"`
-	DecisionID  string       `json:"decision_id,omitempty"`
-	RemoteAddr  string       `json:"remote_addr"`
-	Query       string       `json:"query"`
-	Path        string       `json:"path"`
-	Timestamp   string       `json:"timestamp"`
-	Input       interface{}  `json:"input,omitempty"`
-	Result      *interface{} `json:"result,omitempty"`
-	Error       *ErrorV1     `json:"error,omitempty"`
-	Explanation TraceV1      `json:"explanation,omitempty"`
-	Metrics     MetricsV1    `json:"metrics,omitempty"`
 }
 
 // MetricsV1 models a collection of performance metrics.
@@ -199,6 +183,7 @@ const (
 	ExplainOffV1   ExplainModeV1 = "off"
 	ExplainFullV1  ExplainModeV1 = "full"
 	ExplainNotesV1 ExplainModeV1 = "notes"
+	ExplainFailsV1 ExplainModeV1 = "fails"
 )
 
 // TraceV1 models the trace result returned for queries that include the
@@ -380,7 +365,7 @@ type CompileRequestV1 struct {
 	Unknowns *[]string    `json:"unknowns"`
 }
 
-// CompileResponseV1 models the response messaage for Compile API operations.
+// CompileResponseV1 models the response message for Compile API operations.
 type CompileResponseV1 struct {
 	Result      *interface{} `json:"result,omitempty"`
 	Explanation TraceV1      `json:"explanation,omitempty"`

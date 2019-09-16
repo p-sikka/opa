@@ -7,18 +7,21 @@ package rego
 import (
 	"context"
 	"encoding/json"
-	"github.com/open-policy-agent/opa/internal/storage/mock"
+	"log"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/internal/storage/mock"
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
 	"github.com/open-policy-agent/opa/topdown"
 	"github.com/open-policy-agent/opa/types"
 	"github.com/open-policy-agent/opa/util"
+	"github.com/open-policy-agent/opa/util/test"
 )
 
 func assertEval(t *testing.T, r *Rego, expected string) {
@@ -821,4 +824,291 @@ func TestModulePassing(t *testing.T) {
 	if !reflect.DeepEqual(rs[0].Expressions[0].Value, exp) {
 		t.Fatalf("Expected %v but got %v", exp, rs[0].Expressions[0].Value)
 	}
+}
+
+func TestUnsafeBuiltins(t *testing.T) {
+
+	ctx := context.Background()
+
+	unsafeCountExpr := "unsafe built-in function calls in expression: count"
+
+	t.Run("unsafe query", func(t *testing.T) {
+		r := New(
+			Query(`count([1, 2, 3])`),
+			UnsafeBuiltins(map[string]struct{}{"count": struct{}{}}),
+		)
+		if _, err := r.Eval(ctx); err == nil || !strings.Contains(err.Error(), unsafeCountExpr) {
+			t.Fatalf("Expected unsafe built-in error but got %v", err)
+		}
+	})
+
+	t.Run("unsafe module", func(t *testing.T) {
+		r := New(
+			Query(`data.pkg.deny`),
+			Module("pkg.rego", `package pkg
+			deny {
+				count(input.requests) > 10
+			}
+			`),
+			UnsafeBuiltins(map[string]struct{}{"count": struct{}{}}),
+		)
+		if _, err := r.Eval(ctx); err == nil || !strings.Contains(err.Error(), unsafeCountExpr) {
+			t.Fatalf("Expected unsafe built-in error but got %v", err)
+		}
+	})
+
+	t.Run("inherit in query", func(t *testing.T) {
+		r := New(
+			Compiler(ast.NewCompiler().WithUnsafeBuiltins(map[string]struct{}{"count": struct{}{}})),
+			Query("count([])"),
+		)
+		if _, err := r.Eval(ctx); err == nil || !strings.Contains(err.Error(), unsafeCountExpr) {
+			t.Fatalf("Expected unsafe built-in error but got %v", err)
+		}
+	})
+
+	t.Run("override/disable in query", func(t *testing.T) {
+		r := New(
+			Compiler(ast.NewCompiler().WithUnsafeBuiltins(map[string]struct{}{"count": struct{}{}})),
+			UnsafeBuiltins(map[string]struct{}{}),
+			Query("count([])"),
+		)
+		if _, err := r.Eval(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("override/change in query", func(t *testing.T) {
+		r := New(
+			Compiler(ast.NewCompiler().WithUnsafeBuiltins(map[string]struct{}{"count": struct{}{}})),
+			UnsafeBuiltins(map[string]struct{}{"max": struct{}{}}),
+			Query("count([]); max([1,2])"),
+		)
+
+		_, err := r.Eval(ctx)
+		if err == nil || err.Error() != "1 error occurred: 1:12: rego_type_error: unsafe built-in function calls in expression: max" {
+			t.Fatalf("expected error for max but got: %v", err)
+		}
+	})
+
+	t.Run("ignore if given compiler", func(t *testing.T) {
+		r := New(
+			Compiler(ast.NewCompiler()),
+			UnsafeBuiltins(map[string]struct{}{"count": struct{}{}}),
+			Query("data.test.p = 0"),
+			Module("test.rego", `package test
+
+			p = count([])`),
+		)
+		rs, err := r.Eval(context.Background())
+		if err != nil || len(rs) != 1 {
+			log.Fatalf("Unexpected error or result. Result: %v. Error: %v", rs, err)
+		}
+	})
+}
+
+func TestPreparedQueryGetModules(t *testing.T) {
+	mods := map[string]string{
+		"a.rego": "package a\np = 1",
+		"b.rego": "package b\nq = 1",
+		"c.rego": "package c\nr = 1",
+	}
+
+	var regoArgs []func(r *Rego)
+
+	for name, mod := range mods {
+		regoArgs = append(regoArgs, Module(name, mod))
+	}
+
+	regoArgs = append(regoArgs, Query("data"))
+
+	ctx := context.Background()
+	pq, err := New(regoArgs...).PrepareForEval(ctx)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	actualMods := pq.Modules()
+
+	if len(actualMods) != len(mods) {
+		t.Fatalf("Expected %d modules, got %d", len(mods), len(actualMods))
+	}
+
+	for name, actualMod := range actualMods {
+		expectedMod, found := mods[name]
+		if !found {
+			t.Fatalf("Unexpected module %s", name)
+		}
+		if actualMod.String() != ast.MustParseModule(expectedMod).String() {
+			t.Fatalf("Modules for %s do not match.\n\nExpected:\n%s\n\nActual:\n%s\n\n",
+				name, actualMod.String(), expectedMod)
+		}
+	}
+}
+
+func TestRegoEvalWithFile(t *testing.T) {
+	files := map[string]string{
+		"x/x.rego": "package x\np = 1",
+		"x/x.json": `{"y": "foo"}`,
+	}
+
+	test.WithTempFS(files, func(path string) {
+		ctx := context.Background()
+
+		pq, err := New(
+			Load([]string{path}, nil),
+			Query("data"),
+		).PrepareForEval(ctx)
+
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		rs, err := pq.Eval(ctx)
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		assertResultSet(t, rs, `[[{"x":{"p":1,"y":"foo"}}]]`)
+	})
+}
+
+func TestRegoEvalWithBundle(t *testing.T) {
+	files := map[string]string{
+		"x/x.rego":            "package x\np = data.x.b",
+		"x/data.json":         `{"b": "bar"}`,
+		"other/not-data.json": `{"ignored": "data"}`,
+	}
+
+	test.WithTempFS(files, func(path string) {
+		ctx := context.Background()
+
+		pq, err := New(
+			LoadBundle(path),
+			Query("data.x.p"),
+		).PrepareForEval(ctx)
+
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		rs, err := pq.Eval(ctx)
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		assertResultSet(t, rs, `[["bar"]]`)
+	})
+}
+
+func TestRegoEvalPoliciesinStore(t *testing.T) {
+	store := mock.New()
+	ctx := context.Background()
+	txn := storage.NewTransactionOrDie(ctx, store, storage.WriteParams)
+
+	err := store.UpsertPolicy(ctx, txn, "a.rego", []byte("package a\np=1"))
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+	err = store.Commit(ctx, txn)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	pq, err := New(
+		Store(store),
+		Module("b.rego", "package b\np = data.a.p"),
+		Query("data.b.p"),
+	).PrepareForEval(ctx)
+
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	rs, err := pq.Eval(ctx)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	assertResultSet(t, rs, `[[1]]`)
+}
+
+func TestRegoEvalModulesOnCompiler(t *testing.T) {
+	compiler := ast.NewCompiler()
+
+	compiler.Compile(map[string]*ast.Module{
+		"a.rego": ast.MustParseModule("package a\np = 1"),
+	})
+
+	if len(compiler.Errors) > 0 {
+		t.Fatalf("Unexpected compile errors: %s", compiler.Errors)
+	}
+
+	ctx := context.Background()
+
+	pq, err := New(
+		Compiler(compiler),
+		Query("data.a.p"),
+	).PrepareForEval(ctx)
+
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	rs, err := pq.Eval(ctx)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	assertResultSet(t, rs, `[[1]]`)
+}
+
+func TestRegoLoadFilesWithProvidedStore(t *testing.T) {
+	ctx := context.Background()
+	store := mock.New()
+
+	files := map[string]string{
+		"x.rego": "package x\np = data.x.b",
+	}
+
+	test.WithTempFS(files, func(path string) {
+		pq, err := New(
+			Store(store),
+			Query("data"),
+			Load([]string{path}, nil),
+		).PrepareForEval(ctx)
+
+		if err == nil {
+			t.Fatal("Expected an error but err == nil")
+		}
+
+		if pq.r != nil {
+			t.Fatalf("Expected pq.r == nil, got: %+v", pq)
+		}
+	})
+}
+
+func TestRegoLoadBundleWithProvidedStore(t *testing.T) {
+	ctx := context.Background()
+	store := mock.New()
+
+	files := map[string]string{
+		"x/x.rego": "package x\np = data.x.b",
+	}
+
+	test.WithTempFS(files, func(path string) {
+		pq, err := New(
+			Store(store),
+			Query("data"),
+			LoadBundle(path),
+		).PrepareForEval(ctx)
+
+		if err == nil {
+			t.Fatal("Expected an error but err == nil")
+		}
+
+		if pq.r != nil {
+			t.Fatalf("Expected pq.r == nil, got: %+v", pq)
+		}
+	})
 }

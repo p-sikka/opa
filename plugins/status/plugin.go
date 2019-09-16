@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"reflect"
 
+	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/plugins"
 	"github.com/open-policy-agent/opa/plugins/bundle"
 	"github.com/open-policy-agent/opa/util"
@@ -21,21 +22,26 @@ import (
 // UpdateRequestV1 represents the status update message that OPA sends to
 // remote HTTP endpoints.
 type UpdateRequestV1 struct {
-	Labels    map[string]string `json:"labels"`
-	Bundle    *bundle.Status    `json:"bundle,omitempty"`
-	Discovery *bundle.Status    `json:"discovery,omitempty"`
+	Labels    map[string]string         `json:"labels"`
+	Bundle    *bundle.Status            `json:"bundle,omitempty"` // Deprecated: Use bulk `bundles` status updates instead
+	Bundles   map[string]*bundle.Status `json:"bundles,omitempty"`
+	Discovery *bundle.Status            `json:"discovery,omitempty"`
+	Metrics   map[string]interface{}    `json:"metrics,omitempty"`
 }
 
 // Plugin implements status reporting. Updates can be triggered by the caller.
 type Plugin struct {
-	manager          *plugins.Manager
-	config           Config
-	bundleCh         chan bundle.Status
-	lastBundleStatus *bundle.Status
-	discoCh          chan bundle.Status
-	lastDiscoStatus  *bundle.Status
-	stop             chan chan struct{}
-	reconfig         chan interface{}
+	manager            *plugins.Manager
+	config             Config
+	bundleCh           chan bundle.Status // Deprecated: Use bulk bundle status updates instead
+	lastBundleStatus   *bundle.Status     // Deprecated: Use bulk bundle status updates instead
+	bulkBundleCh       chan map[string]*bundle.Status
+	lastBundleStatuses map[string]*bundle.Status
+	discoCh            chan bundle.Status
+	lastDiscoStatus    *bundle.Status
+	stop               chan chan struct{}
+	reconfig           chan interface{}
+	metrics            metrics.Metrics
 }
 
 // Config contains configuration for the plugin.
@@ -88,17 +94,21 @@ func ParseConfig(config []byte, services []string) (*Config, error) {
 
 // New returns a new Plugin with the given config.
 func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
-
-	plugin := &Plugin{
-		manager:  manager,
-		config:   *parsedConfig,
-		bundleCh: make(chan bundle.Status),
-		discoCh:  make(chan bundle.Status),
-		stop:     make(chan chan struct{}),
-		reconfig: make(chan interface{}),
+	return &Plugin{
+		manager:      manager,
+		config:       *parsedConfig,
+		bundleCh:     make(chan bundle.Status),
+		bulkBundleCh: make(chan map[string]*bundle.Status),
+		discoCh:      make(chan bundle.Status),
+		stop:         make(chan chan struct{}),
+		reconfig:     make(chan interface{}),
 	}
+}
 
-	return plugin
+// WithMetrics sets the global metrics provider to be used by the plugin.
+func (p *Plugin) WithMetrics(m metrics.Metrics) *Plugin {
+	p.metrics = m
+	return p
 }
 
 // Name identifies the plugin on manager.
@@ -128,8 +138,14 @@ func (p *Plugin) Stop(ctx context.Context) {
 }
 
 // UpdateBundleStatus notifies the plugin that the policy bundle was updated.
+// Deprecated: Use BulkUpdateBundleStatus instead.
 func (p *Plugin) UpdateBundleStatus(status bundle.Status) {
 	p.bundleCh <- status
+}
+
+// BulkUpdateBundleStatus notifies the plugin that the policy bundle was updated.
+func (p *Plugin) BulkUpdateBundleStatus(status map[string]*bundle.Status) {
+	p.bulkBundleCh <- status
 }
 
 // UpdateDiscoveryStatus notifies the plugin that the discovery bundle was updated.
@@ -148,15 +164,25 @@ func (p *Plugin) loop() {
 
 	for {
 		select {
+		case statuses := <-p.bulkBundleCh:
+			p.lastBundleStatuses = statuses
+			err := p.oneShot(ctx)
+			if err != nil {
+				p.logError("%v.", err)
+			} else {
+				p.logInfo("Status update sent successfully in response to bundle update.")
+			}
 		case status := <-p.bundleCh:
-			err := p.oneShot(ctx, false, status)
+			p.lastBundleStatus = &status
+			err := p.oneShot(ctx)
 			if err != nil {
 				p.logError("%v.", err)
 			} else {
 				p.logInfo("Status update sent successfully in response to bundle update.")
 			}
 		case status := <-p.discoCh:
-			err := p.oneShot(ctx, true, status)
+			p.lastDiscoStatus = &status
+			err := p.oneShot(ctx)
 			if err != nil {
 				p.logError("%v.", err)
 			} else {
@@ -174,18 +200,17 @@ func (p *Plugin) loop() {
 	}
 }
 
-func (p *Plugin) oneShot(ctx context.Context, disco bool, status bundle.Status) error {
+func (p *Plugin) oneShot(ctx context.Context) error {
 
-	if disco {
-		p.lastDiscoStatus = &status
-	} else {
-		p.lastBundleStatus = &status
-	}
-
-	req := UpdateRequestV1{
+	req := &UpdateRequestV1{
 		Labels:    p.manager.Labels(),
 		Discovery: p.lastDiscoStatus,
 		Bundle:    p.lastBundleStatus,
+		Bundles:   p.lastBundleStatuses,
+	}
+
+	if p.metrics != nil {
+		req.Metrics = map[string]interface{}{p.metrics.Info().Name: p.metrics.All()}
 	}
 
 	resp, err := p.manager.Client(p.config.Service).

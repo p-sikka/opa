@@ -1,7 +1,7 @@
 ---
 title: REST API
 kind: documentation
-weight: 7
+weight: 80
 restrictedtoc: true
 ---
 
@@ -640,7 +640,7 @@ PUT /v1/policies/example1 HTTP/1.1
 Content-Type: text/plain
 ```
 
-```ruby
+```live:put_example:module:read_only
 package opa.examples
 
 import data.servers
@@ -710,7 +710,7 @@ Content-Type: application/json
 
 ## Data API
 
-The Data API exposes endpoints for reading and writing documents in OPA. For an introduction to the different types of documents in OPA see [How Does OPA Work?](../how-does-opa-work).
+The Data API exposes endpoints for reading and writing documents in OPA. For an introduction to the different types of documents in OPA see [How Does OPA Work?](../#how-does-opa-work).
 
 ### Get a Document
 
@@ -1033,7 +1033,7 @@ Get a document that requires input.
 
 The path separator is used to access values inside object and array documents. If the path indexes into an array, the server will attempt to convert the array index to an integer. If the path element cannot be converted to an integer, the server will respond with 404.
 
-The request body contains an object that specifies a value for [The input Document](../how-does-opa-work#the-input-document).
+The request body contains an object that specifies a value for [The input Document](../#the-input-document).
 
 #### Request Headers
 
@@ -1076,7 +1076,7 @@ case, the response will not contain a `result` property.
 
 The examples below assume the following policy:
 
-```ruby
+```live:input_exmaple:module:read_only
 package opa.examples
 
 import input.example.flag
@@ -1154,7 +1154,7 @@ Use this API if you are enforcing policy decisions via webhooks that have pre-de
 request/response formats. Note, the API path prefix is `/v0` instead of `/v1`.
 
 The request message body defines the content of the [The input
-Document](../how-does-opa-work#the-input-document). The request message body
+Document](../#the-input-document). The request message body
 may be empty. The path separator is used to access values inside object and
 array documents.
 
@@ -1177,7 +1177,7 @@ If the requested document is missing or undefined, the server will return 404 an
 
 The examples below assume the following policy:
 
-```ruby
+```live:webhook_example:module:read_only
 package opa.examples
 
 import input.example.flag
@@ -1370,17 +1370,17 @@ If the default decision (defaulting to `/system/main`) is undefined, the server 
 
 The policy example below shows how to define a rule that will
 produce a value for the `/data/system/main` document. You can configure OPA
-to use a different URL path to serve these queries. See the [Configuration Reference](../configuration)
+to use a different URL path to serve these queries. See the [Configuration Reference](../management/#configuration-reference)
 for more information.
 
-The request message body is mapped to the [Input Document](../how-does-opa-work#the-input-document).
+The request message body is mapped to the [Input Document](../#the-input-document).
 
 ```http
 PUT /v1/policies/example1 HTTP/1.1
 Content-Type: text/plain
 ```
 
-```ruby
+```live:system_example:module:read_only
 package system
 
 main = msg {
@@ -1517,7 +1517,7 @@ Compile API requests contain the following fields:
 
 The example below assumes that OPA has been given the following policy:
 
-```ruby
+```live:compile_example:module:read_only
 package example
 
 allow {
@@ -1609,7 +1609,7 @@ When you partially evaluate a query with the Compile API, OPA returns a new set 
 
 For example, if you extend to policy above to include a "break glass" condition, the decision may be to allow all requests regardless of clearance level.
 
-```ruby
+```live:compile_unconditional_example:module:read_only
 package example
 
 allow {
@@ -1688,7 +1688,7 @@ It is also possible for queries to _never_ be true. For example, the
 original policy could be extended to require that users be granted an
 exception:
 
-```ruby
+```live:compile_unconditional_false_example:module:read_only
 package example
 
 allow {
@@ -1971,7 +1971,11 @@ Content-Type: application/json
     "build_commit": "1955fc4d",
     "build_host": "foo.com",
     "build_timestamp": "2019-04-29T23:42:04Z",
-    "revision": "ID-b1298a6c-6ad8-11e9-a26f-d38b5ceadad5",
+    "bundles": {
+      "authz": {
+        "revision": "ID-b1298a6c-6ad8-11e9-a26f-d38b5ceadad5"
+      }
+    },
     "version": "0.10.8-dev"
   },
   "result": true
@@ -1984,7 +1988,11 @@ OPA currently supports the following query provenance information:
 - **build_commit**: The git commit id of this OPA build.
 - **build_timestamp**: The timestamp when this instance was built.
 - **build_host**: The hostname where this instance was built.
-- **revision**: The _revision_ string included in a .manifest file (if present) within a bundle.
+- **revision**: (Deprecated) The _revision_ string included in a .manifest file (if present) within
+  a bundle. Omitted when `bundles` are configured.
+- **bundles**: A set of key-value pairs describing each bundle activated on the server. Includes
+  the `revision` field which is the _revision_ string included in a .manifest file (if present)
+  within a bundle
 
 ## Watches
 
@@ -2040,13 +2048,13 @@ that the server is operational. Optionally it can account for bundle activation 
 `bundle` - Boolean parameter to account for bundle activation status in response.
 
 #### Status Codes
-- **200** - OPA service is healthy. If `bundle=true` the configured bundle has
+- **200** - OPA service is healthy. If `bundle=true` then all configured bundles have
             been activated.
-- **500** - OPA service is not healthy. If `bundle=true` this can mean the
-            configured bundle has not yet been activated.
+- **500** - OPA service is not healthy. If `bundle=true` this can mean any of the configured
+            bundles have not yet been activated.
 
 > *Note*: The bundle activation check is only for initial startup. Subsequent downloads
-  will not affect the health check. The [Status](/docs/{{< current_version >}}/status)
+  will not affect the health check. The [Status](../management/#status)
   API should be used for more fine-grained bundle status monitoring.
 
 #### Example Request

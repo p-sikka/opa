@@ -9,7 +9,10 @@ import (
 	"bytes"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"testing"
+
+	"github.com/open-policy-agent/opa/rego"
 
 	"github.com/open-policy-agent/opa/internal/presentation"
 	"github.com/open-policy-agent/opa/util"
@@ -172,4 +175,121 @@ func TestEvalReturnsRegoError(t *testing.T) {
 	if _, ok := err.(regoError); !ok {
 		t.Fatal("expected regoError but got:", err)
 	}
+}
+
+func TestEvalWithBundleData(t *testing.T) {
+	files := map[string]string{
+		"x/x.rego":            "package x\np = 1",
+		"x/data.json":         `{"b": "bar"}`,
+		"other/not-data.json": `{"ignored": "data"}`,
+	}
+
+	test.WithTempFS(files, func(path string) {
+
+		params := newEvalCommandParams()
+		params.bundlePaths = repeatedStringFlag{
+			v:     []string{path},
+			isSet: true,
+		}
+
+		var buf bytes.Buffer
+
+		defined, err := eval([]string{"data"}, params, &buf)
+		if !defined || err != nil {
+			t.Fatalf("Unexpected undefined or error: %v", err)
+		}
+
+		var output presentation.Output
+
+		if err := util.NewJSONDecoder(&buf).Decode(&output); err != nil {
+			t.Fatal(err)
+		}
+
+		assertResultSet(t, output.Result, `[[{"x": {"p": 1, "b": "bar"}}]]`)
+	})
+}
+
+func TestEvalWithBundleDuplicateFileNames(t *testing.T) {
+	files := map[string]string{
+		// bundle a
+		"a/policy.rego": "package a\np = 1",
+		"a/.manifest":   `{"roots":["a"]}`,
+
+		// bundle b
+		"b/policy.rego": "package b\nq = 1",
+		"b/.manifest":   `{"roots":["b"]}`,
+	}
+
+	test.WithTempFS(files, func(path string) {
+
+		params := newEvalCommandParams()
+		params.bundlePaths = repeatedStringFlag{
+			v: []string{
+				filepath.Join(path, "a"),
+				filepath.Join(path, "b"),
+			},
+			isSet: true,
+		}
+
+		var buf bytes.Buffer
+
+		defined, err := eval([]string{"data"}, params, &buf)
+		if !defined || err != nil {
+			t.Fatalf("Unexpected undefined or error: %v", err)
+		}
+
+		var output presentation.Output
+
+		if err := util.NewJSONDecoder(&buf).Decode(&output); err != nil {
+			t.Fatal(err)
+		}
+
+		assertResultSet(t, output.Result, `[[{"a":{"p":1},"b":{"q":1}}]]`)
+	})
+}
+
+func assertResultSet(t *testing.T, rs rego.ResultSet, expected string) {
+	t.Helper()
+	result := []interface{}{}
+
+	for i := range rs {
+		values := []interface{}{}
+		for j := range rs[i].Expressions {
+			values = append(values, rs[i].Expressions[j].Value)
+		}
+		result = append(result, values)
+	}
+
+	parsedExpected := util.MustUnmarshalJSON([]byte(expected))
+	if !reflect.DeepEqual(result, parsedExpected) {
+		t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", parsedExpected, result)
+	}
+}
+
+func TestEvalErrorJSONOutput(t *testing.T) {
+	params := newEvalCommandParams()
+	err := params.outputFormat.Set(evalJSONOutput)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	var buf bytes.Buffer
+
+	defined, err := eval([]string{"{1,2,3} == {1,x,3}"}, params, &buf)
+	if defined && err == nil {
+		t.Fatalf("Expected an error")
+	}
+
+	// Only check that it *can* be loaded as valid JSON, and that the errors
+	// are populated.
+	var output map[string]interface{}
+
+	if err := util.NewJSONDecoder(&buf).Decode(&output); err != nil {
+		t.Fatal(err)
+	}
+
+	if output["error"] == nil {
+		t.Fatalf("Expected error to be non-nil")
+	}
+
 }

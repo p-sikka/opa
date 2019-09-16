@@ -21,9 +21,8 @@ import (
 )
 
 const (
-	defaultAddr                        = ":8181"        // default listening address for server
-	defaultHistoryFile                 = ".opa_history" // default filename for shell history
-	defaultServerDiagnosticsBufferSize = 10             // default number of items to keep in diagnostics buffer for server
+	defaultAddr        = ":8181"        // default listening address for server
+	defaultHistoryFile = ".opa_history" // default filename for shell history
 )
 
 func init() {
@@ -46,8 +45,6 @@ func init() {
 		"basic": server.AuthorizationBasic,
 		"off":   server.AuthorizationOff,
 	}
-
-	var serverDiagnosticsBufferSize int
 
 	logLevel := util.NewEnumFlag("info", []string{"debug", "info", "error"})
 	logFormat := util.NewEnumFlag("json", []string{"text", "json", "json-pretty"})
@@ -76,19 +73,27 @@ an HTTP API for managing policies, reading and writing data, and executing
 queries.
 
 The runtime can be initialized with one or more files that contain policies or
-data. OPA supports both JSON and YAML data. If a directory is given, OPA will
-recursively load the files contained in the directory. When loading from
-directories, only files with known extensions are considered. The current set of
-file extensions that OPA will consider are:
+data. If the '--bundle' option is specified the paths will be treated as policy
+bundles and loaded following standard bundle conventions. The path can be a
+compressed archive file or a directory which will be treated as a bundle.
+Without the '--bundle' flag OPA will recursively load ALL rego, JSON, and YAML
+files.
+
+When loading from directories, only files with known extensions are considered.
+The current set of file extensions that OPA will consider are:
 
 	.json          # JSON data
 	.yaml or .yml  # YAML data
 	.rego          # Rego file
 
-Data file and directory paths can be prefixed with the desired destination in
-the data document with the following syntax:
+Non-bundle data file and directory paths can be prefixed with the desired
+destination in the data document with the following syntax:
 
 	<dotted-path>:<file-path>
+
+File paths can be specified as URLs to resolve ambiguity in paths containing colons:
+
+	$ opa run file:///c:/path/to/data.json
 `,
 		Run: func(cmd *cobra.Command, args []string) {
 
@@ -114,7 +119,6 @@ the data document with the following syntax:
 				Level:  logLevel.String(),
 				Format: logFormat.String(),
 			}
-			params.DiagnosticsBuffer = server.NewBoundedBuffer(serverDiagnosticsBufferSize)
 			params.Paths = args
 			params.Filter = loaderFilter{
 				Ignore: ignore,
@@ -146,8 +150,6 @@ the data document with the following syntax:
 	runCommand.Flags().BoolVarP(&params.Watch, "watch", "w", false, "watch command line files for changes")
 	setMaxErrors(runCommand.Flags(), &params.ErrorLimit)
 	runCommand.Flags().BoolVarP(&params.PprofEnabled, "pprof", "", false, "enables pprof endpoints")
-	runCommand.Flags().IntVarP(&serverDiagnosticsBufferSize, "server-diagnostics-buffer-size", "", defaultServerDiagnosticsBufferSize, "set the size of the server's diagnostics buffer")
-	runCommand.Flags().MarkDeprecated("server-diagnostics-buffer-size", "use decision logging instead")
 	runCommand.Flags().StringVarP(&tlsCertFile, "tls-cert-file", "", "", "set path of TLS certificate file")
 	runCommand.Flags().StringVarP(&tlsPrivateKeyFile, "tls-private-key-file", "", "", "set path of TLS private key file")
 	runCommand.Flags().StringVarP(&tlsCACertFile, "tls-ca-cert-file", "", "", "set path of TLS CA cert file")
@@ -158,10 +160,11 @@ the data document with the following syntax:
 	runCommand.Flags().IntVar(&params.GracefulShutdownPeriod, "shutdown-grace-period", 10, "set the time (in seconds) that the server will wait to gracefully shut down")
 	runCommand.Flags().StringArrayVar(&params.ConfigOverrides, "set", []string{}, "override config values on the command line (use commas to specify multiple values)")
 	runCommand.Flags().StringArrayVar(&params.ConfigOverrideFiles, "set-file", []string{}, "override config values with files on the command line (use commas to specify multiple values)")
+	runCommand.Flags().BoolVarP(&params.BundleMode, "bundle", "b", false, "load paths as bundle files or root directories")
 	setIgnore(runCommand.Flags(), &ignore)
 
 	usageTemplate := `Usage:
-  {{.UseLine}} [flags] [files]
+  {{.UseLine}} [files]
 
 Flags:
 {{.LocalFlags.FlagUsages | trimRightSpace}}
